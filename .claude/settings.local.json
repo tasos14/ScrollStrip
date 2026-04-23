@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(dotnet build *)",
+      "Bash(dotnet run *)",
+      "Bash(kill %1)"
+    ]
+  }
+}
