@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Windows.Forms;
+using Microsoft.UI.Dispatching;
 
 namespace ScrollStrip;
 
@@ -11,6 +12,7 @@ public sealed class TrayIcon : IDisposable
     private readonly AppSettings _settings;
     private SettingsWindow? _settingsWindow;
     private readonly Icon _generatedIcon;
+    private readonly DispatcherQueue _dispatcher = DispatcherQueue.GetForCurrentThread();
 
     public TrayIcon(AppSettings settings)
     {
@@ -18,9 +20,10 @@ public sealed class TrayIcon : IDisposable
 
         var menu = new ContextMenuStrip();
         var settingsItem = new ToolStripMenuItem("Settings");
-        settingsItem.Click += (_, _) => OpenSettings();
+        settingsItem.Click += (_, _) => _dispatcher.TryEnqueue(OpenSettings);
         var quitItem = new ToolStripMenuItem("Quit");
-        quitItem.Click += (_, _) => System.Windows.Application.Current.Shutdown();
+        quitItem.Click += (_, _) => _dispatcher.TryEnqueue(
+            () => ((App)Microsoft.UI.Xaml.Application.Current).Shutdown());
         menu.Items.Add(settingsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(quitItem);
@@ -34,7 +37,7 @@ public sealed class TrayIcon : IDisposable
             ContextMenuStrip = menu,
             Visible = true,
         };
-        _notifyIcon.DoubleClick += (_, _) => OpenSettings();
+        _notifyIcon.DoubleClick += (_, _) => _dispatcher.TryEnqueue(OpenSettings);
     }
 
     private static Icon CreateTrayIcon()
@@ -72,11 +75,9 @@ public sealed class TrayIcon : IDisposable
 
     private void OpenSettings()
     {
-        if (_settingsWindow == null || !_settingsWindow.IsLoaded)
-        {
+        if (_settingsWindow == null)
             _settingsWindow = new SettingsWindow(_settings);
-        }
-        _settingsWindow.Show();
+        _settingsWindow.AppWindow.Show();
         _settingsWindow.Activate();
     }
 

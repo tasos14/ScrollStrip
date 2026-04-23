@@ -1,37 +1,28 @@
-using System.Windows;
-
 namespace ScrollStrip;
 
-public partial class App : System.Windows.Application
+public partial class App : Microsoft.UI.Xaml.Application
 {
     private TrayIcon? _trayIcon;
     private TouchpadListener? _listener;
     private EdgeScrollController? _controller;
 
-    protected override void OnStartup(StartupEventArgs e)
+    protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
-        base.OnStartup(e);
-
         var settings = AppSettings.Load();
         _controller = new EdgeScrollController(settings);
 
         _listener = new TouchpadListener();
-        _listener.ContactsReceived += (contacts, count) =>
-        {
-            // ContactsReceived fires on the message-loop thread; controller is thread-safe for concurrent inertia timer
-            _controller.OnContacts(contacts, count);
-        };
+        _listener.ContactsReceived += (contacts, count) => _controller.OnContacts(contacts, count);
         _listener.Start();
 
         _trayIcon = new TrayIcon(settings);
-
     }
 
-    protected override void OnExit(ExitEventArgs e)
+    public void Shutdown()
     {
         _trayIcon?.Dispose();
         _listener?.Dispose();
         _controller?.Dispose();
-        base.OnExit(e);
+        Exit();
     }
 }

@@ -1,17 +1,25 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>Resources\tray.ico</ApplicationIcon>
     <AssemblyName>ScrollStrip</AssemblyName>
     <RootNamespace>ScrollStrip</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <WindowsPackageType>None</WindowsPackageType>
+    <Platforms>x86;x64;ARM64</Platforms>
   </PropertyGroup>
   <ItemGroup>
-    <Resource Include="Resources\tray.ico" />
+    <!-- WinForms via FrameworkReference avoids importing the WindowsDesktop SDK's
+         WPF XAML compiler, which would conflict with WinUI 3 XAML compilation. -->
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App.WindowsForms" />
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260416003" />
   </ItemGroup>
 </Project>
