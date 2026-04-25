@@ -151,14 +151,14 @@ public sealed class EdgeScrollController : IDisposable
         while (_velocityBuffer.Count > 0 && now - _velocityBuffer.Peek().Ts > VelocityWindowTicks)
             _velocityBuffer.Dequeue();
 
-        int ticks = (int)(_accumulator / WHEEL_DELTA);
-        if (ticks == 0) return;
-        _accumulator -= ticks * WHEEL_DELTA;
+        int amount = (int)_accumulator;
+        if (amount == 0) return;
+        _accumulator -= amount;
 
-        if (_isVertical && _settings.InvertVerticalScroll)    ticks = -ticks;
-        if (!_isVertical && _settings.InvertHorizontalScroll) ticks = -ticks;
+        if (_isVertical && _settings.InvertVerticalScroll)    amount = -amount;
+        if (!_isVertical && _settings.InvertHorizontalScroll) amount = -amount;
 
-        SendScrollEvent(ticks * WHEEL_DELTA, _isVertical);
+        SendScrollEvent(amount, _isVertical);
     }
 
     private void ExitScroll()
