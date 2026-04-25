@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using static ScrollStrip.NativeMethods;
 
@@ -15,19 +17,32 @@ public sealed class EdgeScrollController : IDisposable
     private bool _isVertical; // true = right edge (vertical scroll), false = bottom edge (horizontal)
     private double _accumulator; // sub-tick scroll accumulation
 
-    // Inertia: all fields guarded by _inertiaLock except _inertiaIsVertical (snapshot, write-before-start)
+    // Inertia: _velocity and _inertiaAccumulator guarded by _inertiaLock.
+    // _inertiaIsVertical: written before timer starts (write-before-start).
     private readonly object _inertiaLock = new();
-    private double _velocity;           // EMA of scaled scroll delta (wheel units per HID event)
+    private double _velocity;           // launch velocity set in BeginInertia, decayed by timer
     private double _inertiaAccumulator;
     private bool _inertiaIsVertical;    // snapshot of _isVertical taken when inertia begins
     private System.Timers.Timer? _inertiaTimer;
+    private long _inertiaStartedAt; // Stopwatch timestamp set when inertia begins
+    // HID callback thread only — no lock needed.
+    private double InertiaGraceElapsedMs() =>
+        (double)(Stopwatch.GetTimestamp() - _inertiaStartedAt) / Stopwatch.Frequency * 1000.0;
 
-    private const double VelocityAlpha         = 0.3;   // EMA weight for incoming samples
-    private const double InertiaTickScale      = 2.0;   // approx HID events per 16 ms timer tick
-    private const double InertiaStopThreshold  = 2.0;   // |velocity| below which inertia stops
+    // Velocity buffer: HID callback thread only — no lock needed.
+    // Stores (Stopwatch.GetTimestamp(), scaled wheel units) for the trailing 100 ms of gesture motion.
+    private readonly Queue<(long Ts, double WheelUnits)> _velocityBuffer = new();
+    private static readonly long VelocityWindowTicks = Stopwatch.Frequency / 10; // 100 ms
 
-    // Maps InertiaStrength 1–10 → decay 0.80–0.98 (step 0.02), with 5 → 0.88 matching the original constant
-    private double InertiaDecay => 0.80 + (_settings.InertiaStrength - 1) / 9.0 * 0.18;
+    private const double InertiaTickScale     = 2.0;  // approx HID events per 16 ms timer tick
+    private const double InertiaStopThreshold = 2.0;  // |velocity| below which inertia stops
+
+    // Maps InertiaStrength 1–10 → decay per 16 ms tick.
+    // Strength 1 → 0.92 (~590 ms to 5%), Strength 5 → ~0.951 (~1090 ms), Strength 10 → 0.99 (~4760 ms).
+    private double InertiaDecay => 0.92 + (_settings.InertiaStrength - 1) / 9.0 * 0.07;
+
+    private static readonly string _logPath = Path.Combine(Path.GetTempPath(), "scroll_debug.log");
+    private static void Log(string msg) => File.AppendAllText(_logPath, $"{DateTime.Now:HH:mm:ss.fff} {msg}\n");
 
     public EdgeScrollController(AppSettings settings) => _settings = settings;
 
@@ -46,7 +61,13 @@ public sealed class EdgeScrollController : IDisposable
         if (fingerCount > 1)
         {
             if (_state != State.Idle) ExitScroll();
-            StopInertia();
+            // Touchpads often emit a phantom multi-touch report within ~20ms of a finger lifting.
+            // Protect inertia from being cancelled by these artifacts for 50ms after launch.
+            var graceMs = InertiaGraceElapsedMs();
+            if (graceMs >= 50)
+                StopInertia();
+            else
+                Log($"[INERTIA] Phantom multi-touch ignored ({graceMs:F1} ms after start)");
             return;
         }
 
@@ -80,6 +101,13 @@ public sealed class EdgeScrollController : IDisposable
 
     private void TryEnterEdge(TouchContact contact)
     {
+        // Ignore phantom touches within 50ms of inertia starting (lift artifacts on some touchpads).
+        var graceMs = InertiaGraceElapsedMs();
+        if (graceMs < 50)
+        {
+            Log($"[INERTIA] Phantom edge-contact ignored ({graceMs:F1} ms after start)");
+            return;
+        }
         StopInertia();
 
         bool inRightEdge = _settings.RightEdgeEnabled &&
@@ -95,6 +123,7 @@ public sealed class EdgeScrollController : IDisposable
         _lastNormY = contact.NormY;
         _lastNormX = contact.NormX;
         _accumulator = 0;
+        _velocityBuffer.Clear();
         _state = State.EdgeContact;
 
         if (_settings.LockCursorDuringScroll) LockCursor();
@@ -117,8 +146,10 @@ public sealed class EdgeScrollController : IDisposable
         double scaled = delta * 2000.0 * speed;
         _accumulator += scaled;
 
-        lock (_inertiaLock)
-            _velocity = _velocity * (1 - VelocityAlpha) + scaled * VelocityAlpha;
+        long now = Stopwatch.GetTimestamp();
+        _velocityBuffer.Enqueue((now, scaled));
+        while (_velocityBuffer.Count > 0 && now - _velocityBuffer.Peek().Ts > VelocityWindowTicks)
+            _velocityBuffer.Dequeue();
 
         int ticks = (int)(_accumulator / WHEEL_DELTA);
         if (ticks == 0) return;
@@ -138,22 +169,35 @@ public sealed class EdgeScrollController : IDisposable
         _accumulator = 0;
         if (_settings.LockCursorDuringScroll) UnlockCursor();
 
-        double v;
-        lock (_inertiaLock) v = _velocity;
+        double launchVelocity = 0;
+        if (_velocityBuffer.Count > 0)
+        {
+            double sum = 0;
+            foreach (var (_, wu) in _velocityBuffer) sum += wu;
+            launchVelocity = sum / _velocityBuffer.Count;
+        }
 
-        if (wasScrolling && _settings.InertiaEnabled && Math.Abs(v) >= InertiaStopThreshold)
-            BeginInertia();
+        Log($"[INERTIA] ExitScroll: wasScrolling={wasScrolling} bufCount={_velocityBuffer.Count} launchV={launchVelocity:F2} threshold={InertiaStopThreshold}");
+
+        if (wasScrolling && _settings.InertiaEnabled && Math.Abs(launchVelocity) >= InertiaStopThreshold)
+            BeginInertia(launchVelocity);
         else
             lock (_inertiaLock) { _velocity = 0; _inertiaAccumulator = 0; }
     }
 
-    private void BeginInertia()
+    private int _inertiaTick;
+
+    private void BeginInertia(double launchVelocity)
     {
+        Log($"[INERTIA] START launchV={launchVelocity:F2} decay={InertiaDecay:F4} strength={_settings.InertiaStrength}");
+        _inertiaStartedAt = Stopwatch.GetTimestamp();
         lock (_inertiaLock)
         {
+            _velocity = launchVelocity;       // written before timer starts — write-before-start
             _inertiaAccumulator = 0;
             _inertiaIsVertical = _isVertical; // snapshot axis before state resets
         }
+        _inertiaTick = 0;
 
         _inertiaTimer?.Stop();
         _inertiaTimer?.Dispose();
@@ -164,39 +208,51 @@ public sealed class EdgeScrollController : IDisposable
 
     private void StopInertia()
     {
+        if (_inertiaTimer != null)
+            Log($"[INERTIA] StopInertia() called at tick={_inertiaTick} (external cancel)");
         _inertiaTimer?.Stop();
         _inertiaTimer?.Dispose();
         _inertiaTimer = null;
         lock (_inertiaLock) { _velocity = 0; _inertiaAccumulator = 0; }
+        _velocityBuffer.Clear();
     }
 
     private void OnInertiaTimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
     {
-        int ticks;
+        int amount;
         bool isVertical;
+
+        int tick = Interlocked.Increment(ref _inertiaTick);
 
         lock (_inertiaLock)
         {
             _velocity *= InertiaDecay;
 
+            if (tick % 10 == 1)
+                Log($"[INERTIA] tick={tick} v={_velocity:F2} threshold={InertiaStopThreshold}");
+
             if (Math.Abs(_velocity) < InertiaStopThreshold)
             {
+                Log($"[INERTIA] STOP at tick={tick} v={_velocity:F2} ({tick * 16} ms total)");
                 _velocity = 0;
                 _inertiaTimer?.Stop();
                 return;
             }
 
+            // Accumulate and send the raw integer amount each tick (sub-WHEEL_DELTA allowed).
+            // This mirrors native two-finger inertia: small continuous values that smooth-decelerate,
+            // rather than waiting for 120-unit chunks which causes pauses at low velocity.
             _inertiaAccumulator += _velocity * InertiaTickScale;
-            ticks = (int)(_inertiaAccumulator / WHEEL_DELTA);
-            if (ticks == 0) return;
-            _inertiaAccumulator -= ticks * WHEEL_DELTA;
+            amount = (int)_inertiaAccumulator;
+            if (amount == 0) return;
+            _inertiaAccumulator -= amount;
 
             isVertical = _inertiaIsVertical;
-            if (isVertical && _settings.InvertVerticalScroll)    ticks = -ticks;
-            if (!isVertical && _settings.InvertHorizontalScroll) ticks = -ticks;
+            if (isVertical && _settings.InvertVerticalScroll)    amount = -amount;
+            if (!isVertical && _settings.InvertHorizontalScroll) amount = -amount;
         }
 
-        SendScrollEvent(ticks * WHEEL_DELTA, isVertical);
+        SendScrollEvent(amount, isVertical);
     }
 
     private static void SendScrollEvent(int wheelAmount, bool vertical)
