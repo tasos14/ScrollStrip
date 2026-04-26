@@ -56,7 +56,7 @@ ScrollStrip needs no installation and writes no registry keys except the optiona
 ### Build from source
 
 ```
-git clone https://github.com/<your-username>/ScrollStrip.git
+git clone https://github.com/tasos14/ScrollStrip.git
 cd ScrollStrip
 dotnet run
 ```
