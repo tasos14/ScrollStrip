@@ -1,7 +1,7 @@
 <Window x:Class="ScrollStrip.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="ScrollStrip Settings" Height="570" Width="360"
+        Title="ScrollStrip Settings" SizeToContent="Height" Width="360"
         ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
         ShowInTaskbar="False">
     <Window.Resources>
@@ -36,6 +36,27 @@
                     <GeometryDrawing Brush="#C8C8C8">
                         <GeometryDrawing.Geometry>
                             <RectangleGeometry Rect="15.5,1.75,3,11.5" RadiusX="1.5" RadiusY="1.5"/>
+                        </GeometryDrawing.Geometry>
+                    </GeometryDrawing>
+                </DrawingGroup>
+            </DrawingImage.Drawing>
+        </DrawingImage>
+
+        <!-- Touchpad icon: left edge highlighted -->
+        <DrawingImage x:Key="IconLeftEdge">
+            <DrawingImage.Drawing>
+                <DrawingGroup>
+                    <GeometryDrawing Brush="#F5F5F5">
+                        <GeometryDrawing.Geometry>
+                            <RectangleGeometry Rect="0.75,0.75,18.5,14.5" RadiusX="2.5" RadiusY="2.5"/>
+                        </GeometryDrawing.Geometry>
+                        <GeometryDrawing.Pen>
+                            <Pen Brush="#A8A8A8" Thickness="1.5"/>
+                        </GeometryDrawing.Pen>
+                    </GeometryDrawing>
+                    <GeometryDrawing Brush="#C8C8C8">
+                        <GeometryDrawing.Geometry>
+                            <RectangleGeometry Rect="1.5,1.75,3,11.5" RadiusX="1.5" RadiusY="1.5"/>
                         </GeometryDrawing.Geometry>
                     </GeometryDrawing>
                 </DrawingGroup>
@@ -78,20 +99,32 @@
             </StackPanel>
         </GroupBox>
 
-        <!-- Vertical (right edge) -->
+        <!-- Zone geometry and lifecycle, shared by every edge -->
+        <GroupBox Header="Edge Zone">
+            <StackPanel>
+                <TextBlock Text="{Binding EdgeZoneWidthMm, StringFormat='Zone width: {0:F1} mm'}" Style="{StaticResource DescriptionText}"/>
+                <Slider Minimum="1.5" Maximum="30" TickFrequency="0.5" IsSnapToTickEnabled="True"
+                        Value="{Binding EdgeZoneWidthMm}"/>
+                <CheckBox Content="Only scroll if the touch starts in the zone" IsChecked="{Binding RequireBeginInZone}"/>
+                <CheckBox Content="Stop scrolling when the finger leaves the zone" IsChecked="{Binding StopWhenLeavingZone}"/>
+                <TextBlock Style="{StaticResource DescriptionText}" TextWrapping="Wrap"
+                           Text="Touchpads that don't report their physical size use a percentage of the pad instead (10% by default)."/>
+            </StackPanel>
+        </GroupBox>
+
+        <!-- Vertical (left and right edges) -->
         <GroupBox>
             <GroupBox.Header>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Source="{StaticResource IconLeftEdge}" Width="20" Height="16" Margin="0,0,2,0" VerticalAlignment="Center"/>
                     <Image Source="{StaticResource IconRightEdge}" Width="20" Height="16" Margin="0,0,5,0" VerticalAlignment="Center"/>
-                    <TextBlock Text="Right Edge — Vertical Scroll" Foreground="Black" FontSize="12" Margin="0" VerticalAlignment="Center"/>
+                    <TextBlock Text="Side Edges — Vertical Scroll" Foreground="Black" FontSize="12" Margin="0" VerticalAlignment="Center"/>
                 </StackPanel>
             </GroupBox.Header>
             <StackPanel>
-                <CheckBox Content="Enabled" IsChecked="{Binding RightEdgeEnabled}"/>
+                <CheckBox Content="Right edge" IsChecked="{Binding RightEdgeEnabled}"/>
+                <CheckBox Content="Left edge" IsChecked="{Binding LeftEdgeEnabled}"/>
                 <CheckBox Content="Invert vertical scroll" IsChecked="{Binding InvertVerticalScroll}"/>
-                <TextBlock Text="{Binding RightEdgeWidthPct, StringFormat='Edge width: {0}%'}" Style="{StaticResource DescriptionText}"/>
-                <Slider Minimum="5" Maximum="30" TickFrequency="1" IsSnapToTickEnabled="True"
-                        Value="{Binding RightEdgeWidthPct}"/>
                 <TextBlock Text="{Binding VerticalScrollSpeedMultiplier, StringFormat='Scroll speed: {0:F1}×'}" Style="{StaticResource DescriptionText}"/>
                 <Slider Minimum="0.5" Maximum="5.0" TickFrequency="0.1" IsSnapToTickEnabled="True"
                         Value="{Binding VerticalScrollSpeedMultiplier}"/>
@@ -109,9 +142,6 @@
             <StackPanel>
                 <CheckBox Content="Enabled" IsChecked="{Binding BottomEdgeEnabled}"/>
                 <CheckBox Content="Invert horizontal scroll" IsChecked="{Binding InvertHorizontalScroll}"/>
-                <TextBlock Text="{Binding BottomEdgeHeightPct, StringFormat='Edge height: {0}%'}" Style="{StaticResource DescriptionText}"/>
-                <Slider Minimum="5" Maximum="30" TickFrequency="1" IsSnapToTickEnabled="True"
-                        Value="{Binding BottomEdgeHeightPct}"/>
                 <TextBlock Text="{Binding HorizontalScrollSpeedMultiplier, StringFormat='Scroll speed: {0:F1}×'}" Style="{StaticResource DescriptionText}"/>
                 <Slider Minimum="0.5" Maximum="5.0" TickFrequency="0.1" IsSnapToTickEnabled="True"
                         Value="{Binding HorizontalScrollSpeedMultiplier}"/>

@@ -25,7 +25,7 @@ public sealed class FrameRecorder : IDisposable
         _writer = new StreamWriter(Path, append: false, Encoding.UTF8) { AutoFlush = true };
         _writer.WriteLine("seq,time_s,dt_ms,clock,scan_time_raw,reported_count,finger_count," +
                           "contact_index,contact_id,norm_x,norm_y,tip,confident," +
-                          "pad_w_mm,pad_h_mm,zone,state,emitted_delta");
+                          "pad_w_mm,pad_h_mm,zone,tracked_zone,state,velocity,emitted_delta");
     }
 
     public void Record(TouchFrame frame, EdgeScrollDiagnostics diag)
@@ -41,7 +41,7 @@ public sealed class FrameRecorder : IDisposable
             string head = string.Create(inv, $"{seq},{frame.TimestampSec:F4},{dtMs:F2}," +
                                              $"{frame.Clock},{frame.ScanTimeRaw},{frame.ReportedContactCount},{diag.FingerCount}");
             string tail = string.Create(inv, $"{frame.PadWidthMm:F1},{frame.PadHeightMm:F1}," +
-                                             $"{diag.Zone},{diag.State},{diag.EmittedDelta}");
+                                             $"{diag.Zone},{diag.TrackedZone},{diag.State},{diag.Velocity:F4},{diag.EmittedDelta}");
 
             if (frame.Contacts.Count == 0)
             {

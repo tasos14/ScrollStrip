@@ -213,22 +213,39 @@ From `--record` on the development machine (ELAN PTP, built-in):
 
 The lesson generalises beyond this usage: **any optional HID field may be present and meaningless**, so a field that drives timing needs an independent sanity check.
 
-### Phase 2 — Recognizer (`EdgeScrollController`)
+### Phase 2 — Recognizer (`EdgeScrollController`) — **done**
 
 5. **Zones in mm.**
    - Right and left edges (vertical), default ≈ 12 mm.
    - Bottom edge (horizontal) kept.
    - Settings migrate from %.
+   - Built as one `EdgeZoneWidthMm` (default 12.0, range 1.5–30) shared by every edge, like Scroll's single `scrollZoneWidth`. The left edge is new and off by default; it shares the right edge's speed and invert settings. Side edges win over the bottom edge at the corners.
+   - No migration was needed. The per-edge percentages stay in `settings.json` as the fallback for pads with no physical units. Without units, the exit hysteresis is approximated as 1 % of the pad per mm.
 6. **Zone lifecycle.**
    - Evaluate the zone each frame.
    - *Began-in-zone* restriction (default on): only a contact whose first frame is in the zone can scroll. This fixes a finger sliding in from the centre.
-   - Optional *stop when leaving zone*, with ~2 mm hysteresis.
-   - **Move the cursor lock from zone entry to first emitted scroll.** `TryEnterEdge` currently calls `LockCursor()` on entering `EdgeContact`, before the tap guard has passed, so a finger that merely rests or drifts in the zone pins the cursor — observed as ~250 ms of frozen cursor during ordinary pointer movement along the bottom edge. [O, Windows]
+     - Eligibility is decided on a contact's first frame and held until all fingers lift. A second finger landing and lifting does not reset it, so the original contact can re-enter.
+   - Optional *stop when leaving zone*, with ~2 mm hysteresis. It ends the scroll with no inertia, as Scroll does.
+   - **Cursor lock moved from zone entry to the first emitted scroll.** `TryEnterEdge` used to call `LockCursor()` on entering `EdgeContact`, before the tap guard had passed, so a finger that merely rested or drifted in the zone pinned the cursor. This was observed as ~250 ms of frozen cursor during ordinary pointer movement along the bottom edge. [O, Windows]
+   - Any touch still cancels inertia, in a zone or not (unchanged).
 7. **Velocity tracking.**
    - Skip frames with `dt < 8 ms` but keep the reference sample, so velocity always spans ≥ 8 ms.
    - `wheel = Δnorm/dt × dt_emit × gain`, accumulated as today.
+     - **Deviation:** emission stays displacement × gain (`Δnorm × 2000 × speed`), which keeps scroll distance independent of frame rate. Scroll's velocity × gain shrinks the output on slow frames. Velocity (`Δnorm/dt`, pad lengths/s) is measured separately and kept for the Phase 3 launch.
+   - Movement below the dead zone also keeps the reference, so slow drags accumulate instead of being discarded. A finger at rest for more than 50 ms resamples the reference, so a flick after a pause is not averaged over the pause.
    - Keep the 2 % tap guard, and optionally add a min-velocity start gate (default off, like Scroll).
+     - The gate is `MinStartVelocity`, set in `settings.json` only.
 8. **Strict single finger** after confidence filtering. Keep the 50 ms phantom-contact grace (a Windows-specific artefact).
+
+#### Measured after Phase 2 [O]
+
+| Quantity | Value |
+|---|---|
+| Innermost accepted right-edge contact | 11.8 mm from the edge (limit 12.0) |
+| Speed while scrolling | p50 1.8, p90 4.7, max 13.9 pad lengths/s |
+| Velocity spikes from batched frames | none |
+
+These speeds give Phase 3 its flick threshold directly, so no conversion from Scroll's 30 px per event is needed.
 
 ### Phase 3 — Inertia (new `InertiaScroller`)
 
@@ -267,9 +284,9 @@ The lesson generalises beyond this usage: **any optional HID field may be presen
 
 - A `--record` CSV mode (scan time, contacts, confidence, zone, state, emitted delta) for offline tuning. **Done.** `--record`, `--record=PATH` or `--record PATH`; bare `--record` writes `%APPDATA%\ScrollStrip\record-<timestamp>.csv`. One row per contact:
 
-  `seq, time_s, dt_ms, clock, scan_time_raw, reported_count, finger_count, contact_index, contact_id, norm_x, norm_y, tip, confident, pad_w_mm, pad_h_mm, zone, state, emitted_delta`
+  `seq, time_s, dt_ms, clock, scan_time_raw, reported_count, finger_count, contact_index, contact_id, norm_x, norm_y, tip, confident, pad_w_mm, pad_h_mm, zone, tracked_zone, state, velocity, emitted_delta`
 
-  `clock` is `ScanTime` or `WallClock`, which is what distinguishes a stubbed counter from a misread one. `emitted_delta` covers the gesture path only — inertia ticks on its own timer between frames and cannot be attributed to a frame.
+  `clock` is `ScanTime` or `WallClock`, which is what distinguishes a stubbed counter from a misread one. `zone` is the geometric hit test on every frame; `tracked_zone` is the zone the active scroll belongs to; `velocity` is in pad lengths/s along the scroll axis. `emitted_delta` covers the gesture path only — inertia ticks on its own timer between frames and cannot be attributed to a frame.
 - Unit tests for the recognizer and inertia with an injectable clock and scroll sink. Cover:
   - tap
   - slow drag
