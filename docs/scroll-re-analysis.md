@@ -247,19 +247,44 @@ The lesson generalises beyond this usage: **any optional HID field may be presen
 
 These speeds give Phase 3 its flick threshold directly, so no conversion from Scroll's 30 px per event is needed.
 
-### Phase 3 — Inertia (new `InertiaScroller`)
+### Phase 3 — Inertia (new `InertiaScroller`) — **done**
 
 9. **Launch:**
    - Last-frame rate (or a 2-frame EWMA) in wheel-units per 1/60 s.
+     - Built as an EWMA (α = 2/3) of the ≥ 8 ms velocity samples from Phase 2. It replaces the old mean over a 100 ms buffer.
+     - No coast if the last sample is older than 50 ms, i.e. the finger rested before lifting.
    - Then piecewise boost: ×3 normally, ×8 above a "flick" threshold. Calibrate the threshold to Scroll's 30 px per event at default speed.
+     - Threshold is 3.75 pad lengths/s. Scroll's wheel value is `v × (speed + 2)`, so 30 px/event at the default gain of 8 is a normalized speed of 30 / 8. No pixel conversion is needed. On the development pad this is roughly the fastest 15 % of drags.
+     - The boost switches on abruptly: a release at 3.7 pad/s coasts ~53 notches, one at 3.8 ~145. Scroll does the same. A ramp between ×3 and ×8 is the fix if this ever feels inconsistent.
    - Axis snap is not needed for single-axis edges.
 10. **Loop:**
     - Dedicated thread on `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` at ~60 Hz.
+      - One-shot 16.67 ms due time each tick. It falls back to a standard waitable timer before Windows 10 1803, then to `Thread.Sleep`. Each step's dt is capped at 50 ms so a stalled thread cannot jump.
     - `v *= pow(1 - decel, dt*60)` using the real dt.
     - Post `v` through the fractional accumulator.
+      - **Deviation:** each step posts `v × dt × 60`, not `v`. A late tick then neither shortens nor lengthens the coast. With an exact 60 Hz timer the two are identical.
     - Stop below a terminus.
+      - 2 wheel units per tick, the counterpart of Scroll's 1.1 px.
     - Map `InertiaStrength` 1–10 onto `decel` (5 → 0.08, Scroll's default).
+      - `decel = 0.08 × 2^((5 − s) / 4)`, so 1 → 0.16 and 10 → 0.034.
+    - Physics (`InertiaPhysics`) is separate from the thread and clock, so it can be unit-tested with synthetic dt.
+    - Steps are posted under the scroller's lock, so no step can land after `Stop()` returns.
 11. **Cancel** on any new contact in a zone, as today.
+    - In fact on any single touch after the 50 ms phantom grace, in a zone or not — the existing behaviour, kept.
+
+#### Measured after Phase 3 [O]
+
+Simulated coast at speed multiplier 1.5, strength 5, compared with the pre-Phase-3 model:
+
+| Release speed | Before | After |
+|---|---|---|
+| 1.8 pad/s (median drag) | 19 notches, 1.31 s | 26 notches, 0.98 s |
+| 3.7 pad/s | 40 notches, 1.54 s | 53 notches, 1.13 s |
+| 4.7 pad/s (p90, flick) | 51 notches, 1.62 s | 180 notches, 1.38 s |
+
+Ordinary releases coast slightly further and stop sooner; flicks go ~3.5× further, which is Scroll's long-flick character.
+
+On hardware: 175 coasts from 185 scroll episodes. The other 10 were rested or two-finger releases, correctly not coasting. 45 of 175 were flicks. Launch velocity median 419, p90 2954, max 5480 wheel units per tick, with no outliers.
 
 ### Phase 4 — Zone actions
 
@@ -284,9 +309,9 @@ These speeds give Phase 3 its flick threshold directly, so no conversion from Sc
 
 - A `--record` CSV mode (scan time, contacts, confidence, zone, state, emitted delta) for offline tuning. **Done.** `--record`, `--record=PATH` or `--record PATH`; bare `--record` writes `%APPDATA%\ScrollStrip\record-<timestamp>.csv`. One row per contact:
 
-  `seq, time_s, dt_ms, clock, scan_time_raw, reported_count, finger_count, contact_index, contact_id, norm_x, norm_y, tip, confident, pad_w_mm, pad_h_mm, zone, tracked_zone, state, velocity, emitted_delta`
+  `seq, time_s, dt_ms, clock, scan_time_raw, reported_count, finger_count, contact_index, contact_id, norm_x, norm_y, tip, confident, pad_w_mm, pad_h_mm, zone, tracked_zone, state, velocity, emitted_delta, inertia_launch`
 
-  `clock` is `ScanTime` or `WallClock`, which is what distinguishes a stubbed counter from a misread one. `zone` is the geometric hit test on every frame; `tracked_zone` is the zone the active scroll belongs to; `velocity` is in pad lengths/s along the scroll axis. `emitted_delta` covers the gesture path only — inertia ticks on its own timer between frames and cannot be attributed to a frame.
+  `clock` is `ScanTime` or `WallClock`, which is what distinguishes a stubbed counter from a misread one. `zone` is the geometric hit test on every frame; `tracked_zone` is the zone the active scroll belongs to; `velocity` is in pad lengths/s along the scroll axis; `inertia_launch` is the launch velocity, in wheel units per 1/60 s, on the frame a coast starts. `emitted_delta` covers the gesture path only — inertia ticks on its own timer between frames and cannot be attributed to a frame.
 - Unit tests for the recognizer and inertia with an injectable clock and scroll sink. Cover:
   - tap
   - slow drag

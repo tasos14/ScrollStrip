@@ -248,6 +248,23 @@ internal static class NativeMethods
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 
+    // ── Waitable timer ────────────────────────────────────────────────────
+    public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002; // Windows 10 1803+
+    public const uint TIMER_ALL_ACCESS = 0x001F0003;
+    public const uint WAIT_OBJECT_0 = 0;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWaitableTimerExW(
+        IntPtr lpTimerAttributes, string? lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetWaitableTimer(
+        IntPtr hTimer, ref long pDueTime, int lPeriod,
+        IntPtr pfnCompletionRoutine, IntPtr lpArgToCompletionRoutine, bool fResume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
     // ── Message-only window ───────────────────────────────────────────────
     public static readonly IntPtr HWND_MESSAGE = new(-3);
 
