@@ -12,11 +12,19 @@ public sealed class TrayIcon : IDisposable
     private SettingsWindow? _settingsWindow;
     private readonly Icon _generatedIcon;
 
-    public TrayIcon(AppSettings settings)
+    public TrayIcon(AppSettings settings, string? recordPath = null)
     {
         _settings = settings;
 
         var menu = new ContextMenuStrip();
+        if (recordPath != null)
+        {
+            var recordItem = new ToolStripMenuItem("Show recording…");
+            recordItem.Click += (_, _) => System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo("explorer.exe", $"/select,\"{recordPath}\""));
+            menu.Items.Add(recordItem);
+            menu.Items.Add(new ToolStripSeparator());
+        }
         var settingsItem = new ToolStripMenuItem("Settings");
         settingsItem.Click += (_, _) => OpenSettings();
         var quitItem = new ToolStripMenuItem("Quit");
@@ -29,7 +37,7 @@ public sealed class TrayIcon : IDisposable
 
         _notifyIcon = new NotifyIcon
         {
-            Text = "ScrollStrip",
+            Text = recordPath != null ? "ScrollStrip (recording)" : "ScrollStrip",
             Icon = _generatedIcon,
             ContextMenuStrip = menu,
             Visible = true,

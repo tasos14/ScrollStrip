@@ -185,12 +185,33 @@ every asyncAfter(1/60 s):
 
 ## 9. Plan for ScrollStrip (Windows precision touchpad)
 
-### Phase 1 — Input fidelity (`HidContactParser`, `TouchpadListener`)
+### Phase 1 — Input fidelity (`HidContactParser`, `TouchpadListener`) — **done**
 
 1. **Scan Time** (Digitizer usage `0x56`, 100 µs units, 16-bit wrap). Unwrap it into a monotonic `double TimestampSec` per frame, and use it for all dt math.
+   - **A declared Scan Time cannot be trusted** (see below). `ScanTimeClock` cross-checks it against `Stopwatch` and abandons the counter after 16 consecutive frames that do not advance it, so frame time degrades to the wall clock instead of freezing.
 2. **Confidence** (usage `0x47`). Drop non-confident contacts before counting fingers; this is free firmware palm rejection.
+   - Read in the same `HidP_GetUsages` call as Tip Switch. Contacts default to confident when the descriptor does not declare the usage.
 3. **Hybrid-mode frame assembly.** Accumulate per-report contacts until Contact Count is reached, then emit one frame. Today each report is treated as a whole frame.
+   - `TouchFrameAssembler` buffers slots until Contact Count is reached. `Parse` returns every declared finger collection in link-collection order and never filters, so slot indices stay aligned and the assembler can trim to the count.
+   - A single `WM_INPUT` can batch several reports (`dwCount`); the listener now walks all of them. It previously read only the first.
 4. **Physical size** from `HIDP_VALUE_CAPS` (`PhysicalMax`, `Units`, `UnitsExp`) to get pad mm, with the % fallback kept.
+   - `TryPhysicalMm` decodes the Unit system and length nibbles (SI cm, English inch) and the Unit Exponent nibble. Surfaced on `TouchFrame`; zones still use percentages until Phase 2.
+
+#### Measured on Windows hardware [O]
+
+From `--record` on the development machine (ELAN PTP, built-in):
+
+| Quantity | Value | Consequence |
+|---|---|---|
+| Pad size | 160.0 × 114.9 mm | Scroll's 12.3 mm default edge = 7.7 % of width here, vs the current 10 % ≈ 16 mm |
+| Frame rate | ~89 Hz (p50 dt 11.2 ms) | Not the 120 Hz the macOS gain math assumes. Phase 3 must derive its tick scale from the measured rate, not a constant |
+| Sub-8 ms frames | 4.7 % of contact frames, 19 of 2296 under 1 ms | Batched reports. The Phase 2 ≥ 8 ms velocity window is load-bearing: `Δ/dt` on a 0.02 ms frame is ~500× too large |
+| Confidence | set on every contact | Nothing wrongly dropped |
+| Contact slots | packed, stable `contact_id` | No fixed-slot firmware; the Contact Count prefix rule holds |
+
+**Scan Time may be declared and never advance.** This pad reports usage `0x56` in every frame with a constant value of 0. Trusting it froze frame time, which in turn froze the 50 ms phantom-contact grace in `TryEnterEdge`: the first gesture scrolled, launched inertia, and every later touch was then rejected until an idle gap longer than the 3.2768 s wrap window let the wall-clock fallback advance the clock. Symptom was "scrolling works briefly, then stops, then works again if you wait". The recording showed it as 1229 frames with a single confident contact in the right edge zone and the state still `Idle`; after the fix, 4.
+
+The lesson generalises beyond this usage: **any optional HID field may be present and meaningless**, so a field that drives timing needs an independent sanity check.
 
 ### Phase 2 — Recognizer (`EdgeScrollController`)
 
@@ -202,6 +223,7 @@ every asyncAfter(1/60 s):
    - Evaluate the zone each frame.
    - *Began-in-zone* restriction (default on): only a contact whose first frame is in the zone can scroll. This fixes a finger sliding in from the centre.
    - Optional *stop when leaving zone*, with ~2 mm hysteresis.
+   - **Move the cursor lock from zone entry to first emitted scroll.** `TryEnterEdge` currently calls `LockCursor()` on entering `EdgeContact`, before the tap guard has passed, so a finger that merely rests or drifts in the zone pins the cursor — observed as ~250 ms of frozen cursor during ordinary pointer movement along the bottom edge. [O, Windows]
 7. **Velocity tracking.**
    - Skip frames with `dt < 8 ms` but keep the reference sample, so velocity always spans ≥ 8 ms.
    - `wheel = Δnorm/dt × dt_emit × gain`, accumulated as today.
@@ -243,7 +265,11 @@ every asyncAfter(1/60 s):
 
 ### Verification
 
-- A `--record` CSV mode (scan time, contacts, confidence, zone, state, emitted delta) for offline tuning.
+- A `--record` CSV mode (scan time, contacts, confidence, zone, state, emitted delta) for offline tuning. **Done.** `--record`, `--record=PATH` or `--record PATH`; bare `--record` writes `%APPDATA%\ScrollStrip\record-<timestamp>.csv`. One row per contact:
+
+  `seq, time_s, dt_ms, clock, scan_time_raw, reported_count, finger_count, contact_index, contact_id, norm_x, norm_y, tip, confident, pad_w_mm, pad_h_mm, zone, state, emitted_delta`
+
+  `clock` is `ScanTime` or `WallClock`, which is what distinguishes a stubbed counter from a misread one. `emitted_delta` covers the gesture path only — inertia ticks on its own timer between frames and cannot be attributed to a frame.
 - Unit tests for the recognizer and inertia with an injectable clock and scroll sink. Cover:
   - tap
   - slow drag

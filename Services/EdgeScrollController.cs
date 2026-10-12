@@ -1,12 +1,20 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using static ScrollStrip.NativeMethods;
 
 namespace ScrollStrip;
 
+public enum EdgeZone { None, Right, Bottom }
+
+/// <summary>What the recognizer did with one frame — for --record and for tests.</summary>
+public readonly record struct EdgeScrollDiagnostics(
+    int FingerCount, EdgeZone Zone, string State, int EmittedDelta);
+
 public sealed class EdgeScrollController : IDisposable
 {
     private enum State { Idle, EdgeContact, Scrolling }
+
+    /// <summary>Fired once per frame after the frame has been processed.</summary>
+    public event Action<TouchFrame, EdgeScrollDiagnostics>? FrameProcessed;
 
     private readonly AppSettings _settings;
     private State _state = State.Idle;
@@ -14,9 +22,17 @@ public sealed class EdgeScrollController : IDisposable
     private double _lastNormY;
     private double _lastNormX;
     private bool _isVertical;    // true = right edge (vertical), false = bottom edge (horizontal)
-    private double _accumulator;             // fractional scroll units carried between HID events
+    private double _accumulator;             // fractional scroll units carried between frames
     private double _edgeContactDisplacement; // cumulative movement in EdgeContact; tap guard
     private const double ScrollActivationThreshold = 0.02; // 2% of touchpad — tap can't reach this
+
+    // Frame-scoped: set at the top of OnFrame, read by everything downstream.
+    private double _frameTime;    // monotonic seconds from the HID scan time
+    private int _frameEmitted;    // wheel units emitted by the gesture path this frame
+
+    /// <summary>Touch surface size in mm from the last frame, or 0 when the pad does not report it.</summary>
+    public double PadWidthMm { get; private set; }
+    public double PadHeightMm { get; private set; }
 
     // Inertia state — _velocity and _inertiaAccumulator are guarded by _inertiaLock.
     // _inertiaIsVertical is written before the timer starts (write-before-start guarantee).
@@ -25,14 +41,14 @@ public sealed class EdgeScrollController : IDisposable
     private double _inertiaAccumulator;
     private bool _inertiaIsVertical;
     private System.Timers.Timer? _inertiaTimer;
-    private long _inertiaStartedAt; // Stopwatch.GetTimestamp() captured in BeginInertia
+    private double _inertiaStartedAt = double.NegativeInfinity; // frame time captured in BeginInertia
 
     // Velocity ring buffer — HID callback thread only, no lock needed.
-    // Holds (timestamp, wheel-units) for the last 100 ms of gesture motion.
-    private readonly Queue<(long Ts, double WheelUnits)> _velocityBuffer = new();
-    private static readonly long VelocityWindowTicks = Stopwatch.Frequency / 10; // 100 ms
+    // Holds (frame time, wheel-units) for the last 100 ms of gesture motion.
+    private readonly Queue<(double T, double WheelUnits)> _velocityBuffer = new();
+    private const double VelocityWindowSec = 0.1;
 
-    private const double InertiaTickScale     = 2.0; // approx HID events per 16 ms timer tick
+    private const double InertiaTickScale     = 2.0; // approx frames per 16 ms timer tick
     private const double InertiaStopThreshold = 2.0; // |velocity| below which inertia stops
 
     // Strength 1–10 maps to per-tick decay factor:
@@ -41,13 +57,33 @@ public sealed class EdgeScrollController : IDisposable
     //  10 → 0.99  (~4760 ms)
     private double InertiaDecay => 0.92 + (_settings.InertiaStrength - 1) / 9.0 * 0.07;
 
-    // Milliseconds elapsed since inertia last started. HID callback thread only.
-    private double InertiaGraceElapsedMs() =>
-        (double)(Stopwatch.GetTimestamp() - _inertiaStartedAt) / Stopwatch.Frequency * 1000.0;
+    // Frame time elapsed since inertia last started. HID callback thread only.
+    private double InertiaGraceElapsedMs() => (_frameTime - _inertiaStartedAt) * 1000.0;
 
     public EdgeScrollController(AppSettings settings) => _settings = settings;
 
-    public void OnContacts(List<TouchContact> contacts, int reportedCount)
+    public void OnFrame(TouchFrame frame)
+    {
+        _frameTime    = frame.TimestampSec;
+        _frameEmitted = 0;
+        if (frame.PadWidthMm > 0) { PadWidthMm = frame.PadWidthMm; PadHeightMm = frame.PadHeightMm; }
+
+        // Non-confident contacts are the firmware's palm call — drop them before counting fingers.
+        var activeContacts = frame.ConfidentDown.ToList();
+
+        ProcessFrame(activeContacts);
+
+        if (FrameProcessed != null)
+        {
+            var zone = _state == State.Idle
+                ? (activeContacts.Count == 1 ? HitTest(activeContacts[0]) : EdgeZone.None)
+                : (_isVertical ? EdgeZone.Right : EdgeZone.Bottom);
+            FrameProcessed.Invoke(frame,
+                new EdgeScrollDiagnostics(activeContacts.Count, zone, _state.ToString(), _frameEmitted));
+        }
+    }
+
+    private void ProcessFrame(List<TouchContact> activeContacts)
     {
         if (!_settings.EdgeScrollEnabled)
         {
@@ -56,13 +92,10 @@ public sealed class EdgeScrollController : IDisposable
             return;
         }
 
-        var activeContacts = contacts.Where(c => c.TipDown).ToList();
-        int fingerCount = reportedCount > 0 ? reportedCount : activeContacts.Count;
-
-        if (fingerCount > 1)
+        if (activeContacts.Count > 1)
         {
             if (_state != State.Idle) ExitScroll();
-            // Touchpads emit phantom multi-touch reports within ~20 ms of a finger lifting.
+            // Touchpads emit phantom multi-touch frames within ~20 ms of a finger lifting.
             // Skip StopInertia for 50 ms so these artifacts don't cancel freshly-started inertia.
             if (InertiaGraceElapsedMs() >= 50) StopInertia();
             return;
@@ -74,8 +107,7 @@ public sealed class EdgeScrollController : IDisposable
             return;
         }
 
-        var contact = activeContacts.FirstOrDefault();
-        if (contact == default) { if (_state != State.Idle) ExitScroll(); return; }
+        var contact = activeContacts[0];
 
         switch (_state)
         {
@@ -96,20 +128,28 @@ public sealed class EdgeScrollController : IDisposable
         }
     }
 
+    private EdgeZone HitTest(TouchContact contact)
+    {
+        // Prefer the right edge when both zones overlap.
+        if (_settings.RightEdgeEnabled && contact.NormX >= 1.0 - _settings.RightEdgeWidthPct / 100.0)
+            return EdgeZone.Right;
+        if (_settings.BottomEdgeEnabled && contact.NormY >= 1.0 - _settings.BottomEdgeHeightPct / 100.0)
+            return EdgeZone.Bottom;
+        return EdgeZone.None;
+    }
+
     private void TryEnterEdge(TouchContact contact)
     {
-        // Same phantom-touch guard: a spurious single-contact in the edge zone right after lift
+        // Same phantom-touch guard: a spurious single contact in the edge zone right after lift
         // would restart scrolling and cancel inertia — ignore it during the grace window.
         if (InertiaGraceElapsedMs() < 50) return;
 
         StopInertia();
 
-        bool inRightEdge  = _settings.RightEdgeEnabled  && contact.NormX >= 1.0 - _settings.RightEdgeWidthPct  / 100.0;
-        bool inBottomEdge = _settings.BottomEdgeEnabled && contact.NormY >= 1.0 - _settings.BottomEdgeHeightPct / 100.0;
+        var zone = HitTest(contact);
+        if (zone == EdgeZone.None) return;
 
-        if (!inRightEdge && !inBottomEdge) return;
-
-        _isVertical       = inRightEdge; // prefer right edge when both zones overlap
+        _isVertical       = zone == EdgeZone.Right;
         _trackedContactId = contact.ContactId;
         _lastNormY        = contact.NormY;
         _lastNormX        = contact.NormX;
@@ -143,9 +183,8 @@ public sealed class EdgeScrollController : IDisposable
         double scaled = delta * 2000.0 * speed;
         _accumulator += scaled;
 
-        long now = Stopwatch.GetTimestamp();
-        _velocityBuffer.Enqueue((now, scaled));
-        while (_velocityBuffer.Count > 0 && now - _velocityBuffer.Peek().Ts > VelocityWindowTicks)
+        _velocityBuffer.Enqueue((_frameTime, scaled));
+        while (_velocityBuffer.Count > 0 && _frameTime - _velocityBuffer.Peek().T > VelocityWindowSec)
             _velocityBuffer.Dequeue();
 
         int amount = (int)_accumulator;
@@ -155,6 +194,7 @@ public sealed class EdgeScrollController : IDisposable
         if (_isVertical  && _settings.InvertVerticalScroll)   amount = -amount;
         if (!_isVertical && _settings.InvertHorizontalScroll) amount = -amount;
 
+        _frameEmitted += amount;
         SendScrollEvent(amount, _isVertical);
     }
 
@@ -182,7 +222,7 @@ public sealed class EdgeScrollController : IDisposable
 
     private void BeginInertia(double launchVelocity)
     {
-        _inertiaStartedAt = Stopwatch.GetTimestamp();
+        _inertiaStartedAt = _frameTime;
         lock (_inertiaLock)
         {
             _velocity          = launchVelocity; // written before timer starts — write-before-start

@@ -5,15 +5,21 @@ namespace ScrollStrip;
 
 /// <summary>
 /// Hidden message-only window that receives precision touchpad raw input
-/// and fires ContactsReceived with parsed finger contacts.
+/// and fires FrameReceived once per assembled touch frame.
 /// </summary>
 public sealed class TouchpadListener : IDisposable
 {
-    public event Action<List<TouchContact>, int>? ContactsReceived;
+    public event Action<TouchFrame>? FrameReceived;
+
+    private sealed class Device
+    {
+        public required HidContactParser Parser;
+        public required TouchFrameAssembler Assembler;
+    }
 
     private IntPtr _hwnd;
     private WndProcDelegate? _wndProcDelegate;
-    private readonly Dictionary<IntPtr, HidContactParser> _parsers = new();
+    private readonly Dictionary<IntPtr, Device> _devices = new();
 
     public void Start()
     {
@@ -67,7 +73,7 @@ public sealed class TouchpadListener : IDisposable
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
         if (msg == WM_INPUT)        { HandleRawInput(lParam); return IntPtr.Zero; }
-        if (msg == WM_INPUT_DEVICE_CHANGE) { _parsers.Clear(); return IntPtr.Zero; }
+        if (msg == WM_INPUT_DEVICE_CHANGE) { ClearDevices(); return IntPtr.Zero; }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
@@ -92,28 +98,32 @@ public sealed class TouchpadListener : IDisposable
             uint dwCount   = (uint)Marshal.ReadInt32((IntPtr)p, rawhidOffset + 4);
             if (dwCount == 0 || dwSizeHid == 0) return;
 
+            var device = GetOrCreateDevice(header.hDevice);
+            if (device == null) return;
+
             int dataOffset = rawhidOffset + 8;
-            if (dataOffset + dwSizeHid > size) return;
 
-            byte[] report = new byte[dwSizeHid];
-            Marshal.Copy((IntPtr)(p + dataOffset), report, 0, (int)dwSizeHid);
+            // A single WM_INPUT may batch several reports back to back.
+            for (uint i = 0; i < dwCount; i++)
+            {
+                long offset = dataOffset + (long)i * dwSizeHid;
+                if (offset + dwSizeHid > size) break;
 
-            var parser = GetOrCreateParser(header.hDevice);
-            if (parser == null) return;
+                byte[] report = new byte[dwSizeHid];
+                Marshal.Copy((IntPtr)(p + offset), report, 0, (int)dwSizeHid);
 
-            int contactCount = parser.GetContactCount(report);
-            var contacts = parser.Parse(report);
-
-            if (contacts.Count > 0 || contactCount >= 0)
-                ContactsReceived?.Invoke(contacts, contactCount);
+                var parse = device.Parser.Parse(report);
+                var frame = device.Assembler.Add(parse, device.Parser.PadWidthMm, device.Parser.PadHeightMm);
+                if (frame != null) FrameReceived?.Invoke(frame);
+            }
         }
     }
 
-    private HidContactParser? GetOrCreateParser(IntPtr hDevice)
+    private Device? GetOrCreateDevice(IntPtr hDevice)
     {
         if (hDevice == IntPtr.Zero) return null;
 
-        if (_parsers.TryGetValue(hDevice, out var existing) && existing.IsValid)
+        if (_devices.TryGetValue(hDevice, out var existing) && existing.Parser.IsValid)
             return existing;
 
         var parser = new HidContactParser();
@@ -123,8 +133,15 @@ public sealed class TouchpadListener : IDisposable
             return null;
         }
 
-        _parsers[hDevice] = parser;
-        return parser;
+        var device = new Device { Parser = parser, Assembler = new TouchFrameAssembler() };
+        _devices[hDevice] = device;
+        return device;
+    }
+
+    private void ClearDevices()
+    {
+        foreach (var d in _devices.Values) d.Parser.Dispose();
+        _devices.Clear();
     }
 
     public void Dispose()
@@ -134,8 +151,7 @@ public sealed class TouchpadListener : IDisposable
             PostQuitMessage(0);
             _hwnd = IntPtr.Zero;
         }
-        foreach (var p in _parsers.Values) p.Dispose();
-        _parsers.Clear();
+        ClearDevices();
         _wndProcDelegate = null;
     }
 
