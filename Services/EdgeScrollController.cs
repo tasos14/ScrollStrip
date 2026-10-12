@@ -1,94 +1,166 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using static ScrollStrip.NativeMethods;
 
 namespace ScrollStrip;
 
+public enum EdgeZone { None, Right, Left, Bottom }
+
+/// <summary>What the recognizer did with one frame — for --record and for tests.</summary>
+/// <param name="Zone">Geometric hit test of the single contact this frame, regardless of state.</param>
+/// <param name="TrackedZone">The zone the active scroll belongs to, or None when idle.</param>
+/// <param name="Velocity">Last measured speed along the scroll axis, pad units per second.</param>
+/// <param name="InertiaLaunch">Launch velocity in wheel units per 1/60 s on the frame inertia started, else 0.</param>
+public readonly record struct EdgeScrollDiagnostics(
+    int FingerCount, EdgeZone Zone, EdgeZone TrackedZone, string State, double Velocity, int EmittedDelta,
+    double InertiaLaunch);
+
 public sealed class EdgeScrollController : IDisposable
 {
     private enum State { Idle, EdgeContact, Scrolling }
 
+    /// <summary>Fired once per frame after the frame has been processed.</summary>
+    public event Action<TouchFrame, EdgeScrollDiagnostics>? FrameProcessed;
+
     private readonly AppSettings _settings;
-    private State _state = State.Idle;
+    // Volatile: the wheel-suppression hook reads it from its own thread via IsScrollActive.
+    private volatile State _state = State.Idle;
     private int _trackedContactId = -1;
-    private double _lastNormY;
-    private double _lastNormX;
-    private bool _isVertical;    // true = right edge (vertical), false = bottom edge (horizontal)
-    private double _accumulator;             // fractional scroll units carried between HID events
+    private EdgeZone _zone = EdgeZone.None;  // zone of the active scroll
+    private bool _isVertical;                // true = left/right edge, false = bottom edge
+    private double _accumulator;             // fractional scroll units carried between frames
     private double _edgeContactDisplacement; // cumulative movement in EdgeContact; tap guard
     private const double ScrollActivationThreshold = 0.02; // 2% of touchpad — tap can't reach this
+    private bool _cursorLocked;
 
-    // Inertia state — _velocity and _inertiaAccumulator are guarded by _inertiaLock.
-    // _inertiaIsVertical is written before the timer starts (write-before-start guarantee).
-    private readonly object _inertiaLock = new();
-    private double _velocity;
-    private double _inertiaAccumulator;
-    private bool _inertiaIsVertical;
-    private System.Timers.Timer? _inertiaTimer;
-    private long _inertiaStartedAt; // Stopwatch.GetTimestamp() captured in BeginInertia
+    // Began-in-zone rule: eligibility is decided on a contact's first frame and held until all
+    // fingers lift, so a finger that lands mid-pad can't scroll by sliding into a zone.
+    private int _gestureContactId = -1;
+    private bool _gestureBeganInZone;
 
-    // Velocity ring buffer — HID callback thread only, no lock needed.
-    // Holds (timestamp, wheel-units) for the last 100 ms of gesture motion.
-    private readonly Queue<(long Ts, double WheelUnits)> _velocityBuffer = new();
-    private static readonly long VelocityWindowTicks = Stopwatch.Frequency / 10; // 100 ms
+    // Reference sample for velocity. It only advances once a frame is at least
+    // MinVelocityWindowSec after it and has moved past the dead zone, so batched sub-ms frames
+    // can't produce a near-zero dt and slow drifts still accumulate instead of being discarded.
+    private double _refNormX, _refNormY, _refTime;
+    private double _lastVelocity;            // pad units/s along the scroll axis
+    // Launch estimate: a ~2-frame EWMA of the measured velocity, and when it was last fed.
+    private double _launchVelocity;
+    private double _launchVelocityTime;
+    private bool _haveLaunchVelocity;
+    private const double LaunchEwmaAlpha = 2.0 / 3.0;
+    private const double MinVelocityWindowSec = 0.008;
+    private const double StaleReferenceSec    = 0.05;   // a finger at rest this long resamples the reference
+    private const double DeadZone             = 0.0005;
+    private const double ExitHysteresisMm     = 2.0;
 
-    private const double InertiaTickScale     = 2.0; // approx HID events per 16 ms timer tick
-    private const double InertiaStopThreshold = 2.0; // |velocity| below which inertia stops
+    // Frame-scoped: set at the top of OnFrame, read by everything downstream.
+    private double _frameTime;    // monotonic seconds from the frame clock
+    private int _frameEmitted;    // wheel units emitted by the gesture path this frame
+    private double _frameLaunch;  // inertia launch velocity if it started this frame
 
-    // Strength 1–10 maps to per-tick decay factor:
-    //   1 → 0.92  (~590 ms to 5% of launch velocity)
-    //   5 → 0.951 (~1090 ms)
-    //  10 → 0.99  (~4760 ms)
-    private double InertiaDecay => 0.92 + (_settings.InertiaStrength - 1) / 9.0 * 0.07;
+    /// <summary>Touch surface size in mm from the last frame, or 0 when the pad does not report it.</summary>
+    public double PadWidthMm { get; private set; }
+    public double PadHeightMm { get; private set; }
 
-    // Milliseconds elapsed since inertia last started. HID callback thread only.
-    private double InertiaGraceElapsedMs() =>
-        (double)(Stopwatch.GetTimestamp() - _inertiaStartedAt) / Stopwatch.Frequency * 1000.0;
+    private readonly IScrollOutput _output;
+    private readonly IInertia _inertia;
+    private double _inertiaStartedAt = double.NegativeInfinity; // frame time captured in BeginInertia
+    private const double PhantomGraceMs = 50;
 
-    public EdgeScrollController(AppSettings settings) => _settings = settings;
+    /// <summary>
+    /// Speed, in pad lengths/s, above which a release gets the flick boost. This is Scroll.app's
+    /// 30 px/event at its default gain of 8 (30 / 8). On the development pad it is the top ~15%
+    /// of drag speeds (p50 1.8, p90 4.7).
+    /// </summary>
+    private const double FlickThreshold = 3.75;
+    /// <summary>Wheel units per 1/60 s at which the coast stops; Scroll.app stops at 1.1 px.</summary>
+    private const double InertiaTerminus = 2.0;
 
-    public void OnContacts(List<TouchContact> contacts, int reportedCount)
+    // Frame time elapsed since inertia last started. HID callback thread only.
+    private double InertiaGraceElapsedMs() => (_frameTime - _inertiaStartedAt) * 1000.0;
+
+    /// <param name="output">Wheel and cursor output; real Win32 input when null.</param>
+    /// <param name="inertia">The coast engine; a timer-driven <see cref="InertiaScroller"/> on <paramref name="output"/> when null.</param>
+    public EdgeScrollController(AppSettings settings, IScrollOutput? output = null, IInertia? inertia = null)
     {
-        if (!_settings.EdgeScrollEnabled)
+        _settings = settings;
+        _output   = output ?? new Win32ScrollOutput();
+        _inertia  = inertia ?? new InertiaScroller(_output.Scroll);
+    }
+
+    public void OnFrame(TouchFrame frame)
+    {
+        _frameTime    = frame.TimestampSec;
+        _frameEmitted = 0;
+        _frameLaunch  = 0;
+        if (frame.PadWidthMm > 0) { PadWidthMm = frame.PadWidthMm; PadHeightMm = frame.PadHeightMm; }
+
+        // Non-confident contacts are the firmware's palm call — drop them before counting fingers.
+        var activeContacts = frame.ConfidentDown.ToList();
+
+        ProcessFrame(activeContacts);
+
+        FrameProcessed?.Invoke(frame, new EdgeScrollDiagnostics(
+            activeContacts.Count,
+            activeContacts.Count == 1 ? HitTest(activeContacts[0]) : EdgeZone.None,
+            _zone,
+            _state.ToString(),
+            _lastVelocity,
+            _frameEmitted,
+            _frameLaunch));
+    }
+
+    private void ProcessFrame(List<TouchContact> activeContacts)
+    {
+        if (!_settings.EdgeScrollEnabled || Suspended)
         {
-            if (_state != State.Idle) ExitScroll();
+            if (_state != State.Idle) ExitScroll(allowInertia: false);
             StopInertia();
             return;
         }
 
-        var activeContacts = contacts.Where(c => c.TipDown).ToList();
-        int fingerCount = reportedCount > 0 ? reportedCount : activeContacts.Count;
-
-        if (fingerCount > 1)
+        if (activeContacts.Count > 1)
         {
-            if (_state != State.Idle) ExitScroll();
-            // Touchpads emit phantom multi-touch reports within ~20 ms of a finger lifting.
+            if (_state != State.Idle) ExitScroll(allowInertia: true);
+            // Touchpads emit phantom multi-touch frames within ~20 ms of a finger lifting.
             // Skip StopInertia for 50 ms so these artifacts don't cancel freshly-started inertia.
-            if (InertiaGraceElapsedMs() >= 50) StopInertia();
+            if (InertiaGraceElapsedMs() >= PhantomGraceMs) StopInertia();
             return;
         }
 
         if (activeContacts.Count == 0)
         {
-            if (_state != State.Idle) ExitScroll();
+            if (_state != State.Idle) ExitScroll(allowInertia: true);
+            _gestureContactId = -1;
             return;
         }
 
-        var contact = activeContacts.FirstOrDefault();
-        if (contact == default) { if (_state != State.Idle) ExitScroll(); return; }
+        var contact = activeContacts[0];
+        var zone    = HitTest(contact);
+
+        if (contact.ContactId != _gestureContactId)
+        {
+            _gestureContactId   = contact.ContactId;
+            _gestureBeganInZone = zone != EdgeZone.None;
+        }
 
         switch (_state)
         {
             case State.Idle:
-                TryEnterEdge(contact);
+                TryEnterEdge(contact, zone);
                 break;
 
             case State.EdgeContact:
             case State.Scrolling:
                 if (contact.ContactId != _trackedContactId)
                 {
-                    ExitScroll();
-                    TryEnterEdge(contact);
+                    ExitScroll(allowInertia: true);
+                    TryEnterEdge(contact, zone);
+                    return;
+                }
+                // Scroll.app ends the scroll on leaving the zone, and with no inertia.
+                if (_settings.StopWhenLeavingZone && !InZone(contact, _zone, ExitHysteresisMm))
+                {
+                    ExitScroll(allowInertia: false);
                     return;
                 }
                 ContinueScroll(contact);
@@ -96,146 +168,259 @@ public sealed class EdgeScrollController : IDisposable
         }
     }
 
-    private void TryEnterEdge(TouchContact contact)
-    {
-        // Same phantom-touch guard: a spurious single-contact in the edge zone right after lift
-        // would restart scrolling and cancel inertia — ignore it during the grace window.
-        if (InertiaGraceElapsedMs() < 50) return;
+    // ── Zone geometry ─────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Zone thickness as a fraction of the pad along the zone's axis. Physical when the pad
+    /// reports its size, otherwise the per-edge percentage. Without physical units the hysteresis
+    /// is approximated as 1% of the pad per mm.
+    /// </summary>
+    private double EdgeThicknessNorm(EdgeZone zone, double extraMm)
+    {
+        double padMm = zone == EdgeZone.Bottom ? PadHeightMm : PadWidthMm;
+        if (padMm > 0)
+            return Math.Clamp((_settings.EdgeZoneWidthMm + extraMm) / padMm, 0.005, 0.5);
+
+        double pct = zone switch
+        {
+            EdgeZone.Right => _settings.RightEdgeWidthPct,
+            EdgeZone.Left  => _settings.LeftEdgeWidthPct,
+            _              => _settings.BottomEdgeHeightPct,
+        };
+        return Math.Clamp((pct + extraMm) / 100.0, 0.005, 0.5);
+    }
+
+    private bool InZone(TouchContact c, EdgeZone zone, double extraMm = 0)
+    {
+        double t = EdgeThicknessNorm(zone, extraMm);
+        return zone switch
+        {
+            EdgeZone.Right  => c.NormX >= 1.0 - t,
+            EdgeZone.Left   => c.NormX <= t,
+            EdgeZone.Bottom => c.NormY >= 1.0 - t,
+            _               => false,
+        };
+    }
+
+    private EdgeZone HitTest(TouchContact c)
+    {
+        // Vertical edges win where they overlap the bottom edge's corners.
+        if (_settings.RightEdgeEnabled  && InZone(c, EdgeZone.Right))  return EdgeZone.Right;
+        if (_settings.LeftEdgeEnabled   && InZone(c, EdgeZone.Left))   return EdgeZone.Left;
+        if (_settings.BottomEdgeEnabled && InZone(c, EdgeZone.Bottom)) return EdgeZone.Bottom;
+        return EdgeZone.None;
+    }
+
+    // ── Recognizer ────────────────────────────────────────────────────────
+
+    private void TryEnterEdge(TouchContact contact, EdgeZone zone)
+    {
+        // Same phantom-touch guard: a spurious single contact in the edge zone right after lift
+        // would restart scrolling and cancel inertia — ignore it during the grace window.
+        if (InertiaGraceElapsedMs() < PhantomGraceMs) return;
+
+        // Any touch stops a coasting scroll, in a zone or not.
         StopInertia();
 
-        bool inRightEdge  = _settings.RightEdgeEnabled  && contact.NormX >= 1.0 - _settings.RightEdgeWidthPct  / 100.0;
-        bool inBottomEdge = _settings.BottomEdgeEnabled && contact.NormY >= 1.0 - _settings.BottomEdgeHeightPct / 100.0;
+        if (zone == EdgeZone.None) return;
+        if (_settings.RequireBeginInZone && !_gestureBeganInZone) return;
 
-        if (!inRightEdge && !inBottomEdge) return;
-
-        _isVertical       = inRightEdge; // prefer right edge when both zones overlap
+        _zone             = zone;
+        _isVertical       = zone != EdgeZone.Bottom;
         _trackedContactId = contact.ContactId;
-        _lastNormY        = contact.NormY;
-        _lastNormX        = contact.NormX;
+        _refNormX         = contact.NormX;
+        _refNormY         = contact.NormY;
+        _refTime          = _frameTime;
+        _lastVelocity     = 0;
+        _haveLaunchVelocity = false;
+        _launchVelocity     = 0;
         _accumulator             = 0;
         _edgeContactDisplacement = 0;
-        _velocityBuffer.Clear();
         _state            = State.EdgeContact;
-
-        if (_settings.LockCursorDuringScroll) LockCursor();
     }
 
     private void ContinueScroll(TouchContact contact)
     {
+        double dt    = _frameTime - _refTime;
         double delta = _isVertical
-            ? _lastNormY - contact.NormY
-            : _lastNormX - contact.NormX;
+            ? _refNormY - contact.NormY
+            : _refNormX - contact.NormX;
 
-        _lastNormY = contact.NormY;
-        _lastNormX = contact.NormX;
+        // Keep the reference until the window spans >= 8 ms — the movement carries over.
+        if (dt < MinVelocityWindowSec) return;
 
-        if (Math.Abs(delta) < 0.0005) return; // dead zone
+        if (Math.Abs(delta) < DeadZone)
+        {
+            // A resting finger: resample so a later flick isn't averaged over the rest.
+            if (dt > StaleReferenceSec)
+            {
+                _refNormX = contact.NormX;
+                _refNormY = contact.NormY;
+                _refTime  = _frameTime;
+                _lastVelocity = 0;
+                _haveLaunchVelocity = false;  // lifting a resting finger must not coast
+                _launchVelocity     = 0;
+            }
+            return;
+        }
+
+        _refNormX = contact.NormX;
+        _refNormY = contact.NormY;
+        _refTime  = _frameTime;
+
+        double velocity = delta / dt;
+        _lastVelocity = velocity;
+        _launchVelocity = _haveLaunchVelocity
+            ? LaunchEwmaAlpha * velocity + (1 - LaunchEwmaAlpha) * _launchVelocity
+            : velocity;
+        _haveLaunchVelocity = true;
+        _launchVelocityTime = _frameTime;
 
         if (_state == State.EdgeContact)
         {
             _edgeContactDisplacement += Math.Abs(delta);
             if (_edgeContactDisplacement < ScrollActivationThreshold) return;
+            if (_settings.MinStartVelocity > 0 && Math.Abs(velocity) < _settings.MinStartVelocity) return;
+
+            _state = State.Scrolling;
+            // Pin the cursor only now: a finger resting or drifting in the zone must not freeze it.
+            if (_settings.LockCursorDuringScroll) LockCursor();
         }
-        _state = State.Scrolling;
 
         double speed  = _isVertical ? _settings.VerticalScrollSpeedMultiplier : _settings.HorizontalScrollSpeedMultiplier;
         double scaled = delta * 2000.0 * speed;
         _accumulator += scaled;
 
-        long now = Stopwatch.GetTimestamp();
-        _velocityBuffer.Enqueue((now, scaled));
-        while (_velocityBuffer.Count > 0 && now - _velocityBuffer.Peek().Ts > VelocityWindowTicks)
-            _velocityBuffer.Dequeue();
-
         int amount = (int)_accumulator;
         if (amount == 0) return;
         _accumulator -= amount;
 
-        if (_isVertical  && _settings.InvertVerticalScroll)   amount = -amount;
-        if (!_isVertical && _settings.InvertHorizontalScroll) amount = -amount;
+        if (IsInverted(_zone)) amount = -amount;
 
-        SendScrollEvent(amount, _isVertical);
+        _frameEmitted += amount;
+        _output.Scroll(amount, _isVertical);
     }
 
-    private void ExitScroll()
+    private void ExitScroll(bool allowInertia)
     {
         bool wasScrolling = _state == State.Scrolling;
+        var zone          = _zone;   // the coast needs it after the reset below
         _state            = State.Idle;
         _trackedContactId = -1;
+        _zone             = EdgeZone.None;
         _accumulator      = 0;
-        if (_settings.LockCursorDuringScroll) UnlockCursor();
+        UnlockCursor();
 
-        double launchVelocity = 0;
-        if (_velocityBuffer.Count > 0)
-        {
-            double sum = 0;
-            foreach (var (_, wu) in _velocityBuffer) sum += wu;
-            launchVelocity = sum / _velocityBuffer.Count;
-        }
+        // A launch estimate older than a resting pause means the finger stopped before lifting.
+        bool freshVelocity = _haveLaunchVelocity && _frameTime - _launchVelocityTime <= StaleReferenceSec;
 
-        if (wasScrolling && _settings.InertiaEnabled && Math.Abs(launchVelocity) >= InertiaStopThreshold)
-            BeginInertia(launchVelocity);
-        else
-            lock (_inertiaLock) { _velocity = 0; _inertiaAccumulator = 0; }
+        if (allowInertia && wasScrolling && _settings.InertiaEnabled && freshVelocity)
+            BeginInertia(zone);
     }
 
-    private void BeginInertia(double launchVelocity)
+    private void BeginInertia(EdgeZone zone)
     {
-        _inertiaStartedAt = Stopwatch.GetTimestamp();
-        lock (_inertiaLock)
-        {
-            _velocity          = launchVelocity; // written before timer starts — write-before-start
-            _inertiaAccumulator = 0;
-            _inertiaIsVertical = _isVertical;
-        }
+        double speed  = _isVertical ? _settings.VerticalScrollSpeedMultiplier : _settings.HorizontalScrollSpeedMultiplier;
+        double launch = InertiaPhysics.LaunchVelocity(_launchVelocity, 2000.0 * speed, FlickThreshold);
 
-        _inertiaTimer?.Stop();
-        _inertiaTimer?.Dispose();
-        _inertiaTimer         = new System.Timers.Timer(16) { AutoReset = true };
-        _inertiaTimer.Elapsed += OnInertiaTimerElapsed;
-        _inertiaTimer.Start();
+        if (IsInverted(zone)) launch = -launch;
+
+        if (Math.Abs(launch) <= InertiaTerminus) return;
+
+        _inertiaStartedAt = _frameTime;
+        _frameLaunch      = launch;
+        _inertia.Start(launch, _isVertical,
+            InertiaPhysics.DecelForStrength(_settings.InertiaStrength), InertiaTerminus);
     }
 
-    private void StopInertia()
+    private void StopInertia() => _inertia.Stop();
+
+    /// <summary>Per-zone direction: each side edge has its own invert; the bottom edge uses the horizontal one.</summary>
+    private bool IsInverted(EdgeZone zone) => zone switch
     {
-        _inertiaTimer?.Stop();
-        _inertiaTimer?.Dispose();
-        _inertiaTimer = null;
-        lock (_inertiaLock) { _velocity = 0; _inertiaAccumulator = 0; }
-        _velocityBuffer.Clear();
-    }
+        EdgeZone.Right  => _settings.InvertVerticalScroll,
+        EdgeZone.Left   => _settings.InvertLeftEdgeScroll,
+        EdgeZone.Bottom => _settings.InvertHorizontalScroll,
+        _               => false,
+    };
 
-    private void OnInertiaTimerElapsed(object? sender, System.Timers.ElapsedEventArgs e)
+    // ── Outside events ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Set while the foreground app is excluded. Setting it ends any scroll or coast at once — a
+    /// coast must not run on into the excluded app — and frames are ignored until it is cleared.
+    /// Call on the thread that delivers frames.
+    /// </summary>
+    public bool Suspended
     {
-        int amount;
-        bool isVertical;
-
-        lock (_inertiaLock)
+        get => _suspended;
+        set
         {
-            _velocity *= InertiaDecay;
-
-            if (Math.Abs(_velocity) < InertiaStopThreshold)
-            {
-                _velocity = 0;
-                _inertiaTimer?.Stop();
-                return;
-            }
-
-            _inertiaAccumulator += _velocity * InertiaTickScale;
-            amount = (int)_inertiaAccumulator;
-            if (amount == 0) return;
-            _inertiaAccumulator -= amount;
-
-            isVertical = _inertiaIsVertical;
-            if (isVertical  && _settings.InvertVerticalScroll)   amount = -amount;
-            if (!isVertical && _settings.InvertHorizontalScroll) amount = -amount;
+            if (value && !_suspended) Reset();
+            _suspended = value;
         }
+    }
+    private bool _suspended;
 
-        SendScrollEvent(amount, isVertical);
+    /// <summary>
+    /// True while a scroll is being emitted, by the finger or a coast. Read by the native-wheel
+    /// suppression hook on its own thread, so it touches only volatile state and takes no lock.
+    /// </summary>
+    public bool IsScrollActive => _state == State.Scrolling || _inertia.IsActive;
+
+    /// <summary>
+    /// The watchdog declared the contact's lift report lost. End the gesture without a coast: the
+    /// finger lifted at some unknown point in the silence, so the last velocity is stale.
+    /// </summary>
+    public void OnContactLost()
+    {
+        if (_state != State.Idle) ExitScroll(allowInertia: false);
+        _gestureContactId = -1;
     }
 
-    private static void SendScrollEvent(int wheelAmount, bool vertical)
+    /// <summary>Drops all gesture and coast state — on sleep and on wake.</summary>
+    public void Reset()
+    {
+        if (_state != State.Idle) ExitScroll(allowInertia: false);
+        StopInertia();
+        _gestureContactId = -1;
+        _inertiaStartedAt = double.NegativeInfinity;
+    }
+
+    private void LockCursor()
+    {
+        if (_cursorLocked) return;
+        _cursorLocked = _output.LockCursor();
+    }
+
+    private void UnlockCursor()
+    {
+        if (!_cursorLocked) return;
+        _output.UnlockCursor();
+        _cursorLocked = false;
+    }
+
+    public void Dispose()
+    {
+        _inertia.Dispose();
+        UnlockCursor();
+    }
+}
+
+/// <summary>Where the recognizer's output goes. The default posts real input; tests record it.</summary>
+public interface IScrollOutput
+{
+    /// <summary>Posts a wheel amount; true = vertical. Called on the HID thread and on the inertia thread.</summary>
+    void Scroll(int wheelAmount, bool vertical);
+    /// <summary>Pins the cursor where it is. Returns false if it could not.</summary>
+    bool LockCursor();
+    void UnlockCursor();
+}
+
+/// <summary>Posts wheel events with SendInput and pins the cursor with a 1×1 ClipCursor rect.</summary>
+public sealed class Win32ScrollOutput : IScrollOutput
+{
+    public void Scroll(int wheelAmount, bool vertical)
     {
         var input = new INPUT
         {
@@ -249,14 +434,12 @@ public sealed class EdgeScrollController : IDisposable
         SendInput(1, [input], Marshal.SizeOf<INPUT>());
     }
 
-    private static void LockCursor()
+    public bool LockCursor()
     {
-        if (!GetCursorPos(out var pt)) return;
+        if (!GetCursorPos(out var pt)) return false;
         var rect = new RECT { Left = pt.X, Top = pt.Y, Right = pt.X + 1, Bottom = pt.Y + 1 };
-        ClipCursor(ref rect);
+        return ClipCursor(ref rect);
     }
 
-    private static void UnlockCursor() => ClipCursor(IntPtr.Zero);
-
-    public void Dispose() => StopInertia();
+    public void UnlockCursor() => ClipCursor(IntPtr.Zero);
 }

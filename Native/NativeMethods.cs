@@ -248,6 +248,106 @@ internal static class NativeMethods
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetRegisteredRawInputDevices(
+        [Out] RAWINPUTDEVICE[]? pRawInputDevices, ref uint puiNumDevices, uint cbSize);
+
+    // ── Power notifications ───────────────────────────────────────────────
+    // Message-only windows get no broadcasts, so WM_POWERBROADCAST must be requested explicitly.
+    public const int WM_POWERBROADCAST = 0x0218;
+    public const int PBT_APMSUSPEND = 0x0004;
+    public const int PBT_APMRESUMESUSPEND = 0x0007;
+    public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    public const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr RegisterSuspendResumeNotification(IntPtr hRecipient, uint flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnregisterSuspendResumeNotification(IntPtr handle);
+
+    // ── Window timers ─────────────────────────────────────────────────────
+    public const int WM_TIMER = 0x0113;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool KillTimer(IntPtr hWnd, UIntPtr uIDEvent);
+
+    // ── Foreground tracking ───────────────────────────────────────────────
+    public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+    public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+    public delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+        int idObject, int idChild, uint idEventThread, uint dwmsEventTime);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc,
+        WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    // ── Low-level mouse hook ──────────────────────────────────────────────
+    public const int WH_MOUSE_LL = 14;
+    public const int WM_MOUSEWHEEL = 0x020A;
+    public const int WM_MOUSEHWHEEL = 0x020E;
+    public const uint LLMHF_INJECTED = 0x00000001;
+
+    public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    public const uint WM_QUIT = 0x0012;
+
+    // ── Waitable timer ────────────────────────────────────────────────────
+    public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002; // Windows 10 1803+
+    public const uint TIMER_ALL_ACCESS = 0x001F0003;
+    public const uint WAIT_OBJECT_0 = 0;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWaitableTimerExW(
+        IntPtr lpTimerAttributes, string? lpTimerName, uint dwFlags, uint dwDesiredAccess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetWaitableTimer(
+        IntPtr hTimer, ref long pDueTime, int lPeriod,
+        IntPtr pfnCompletionRoutine, IntPtr lpArgToCompletionRoutine, bool fResume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
     // ── Message-only window ───────────────────────────────────────────────
     public static readonly IntPtr HWND_MESSAGE = new(-3);
 

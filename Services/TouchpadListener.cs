@@ -1,19 +1,53 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using static ScrollStrip.NativeMethods;
 
 namespace ScrollStrip;
 
+/// <summary>Something that happened to the input stream rather than a touch frame.</summary>
+public enum ListenerEvent
+{
+    /// <summary>The system is about to sleep.</summary>
+    Suspending,
+    /// <summary>The system woke; raw input was re-registered and device state rebuilt.</summary>
+    Resumed,
+    /// <summary>The health check found our raw input registration missing and restored it.</summary>
+    Reregistered,
+    /// <summary>A contact went silent past <see cref="FrameWatchdog.StallTimeoutSec"/>: its lift report was lost.</summary>
+    ContactLost,
+}
+
 /// <summary>
-/// Hidden message-only window that receives precision touchpad raw input
-/// and fires ContactsReceived with parsed finger contacts.
+/// Hidden message-only window that receives precision touchpad raw input and fires
+/// FrameReceived once per assembled touch frame.
+///
+/// The window belongs to the thread that calls <see cref="Start"/> — the WPF UI thread — and the
+/// WPF dispatcher pumps its messages, so every event here fires on that thread.
 /// </summary>
 public sealed class TouchpadListener : IDisposable
 {
-    public event Action<List<TouchContact>, int>? ContactsReceived;
+    public event Action<TouchFrame>? FrameReceived;
+    public event Action<ListenerEvent>? EventOccurred;
+
+    private static readonly UIntPtr HealthTimerId = 1;
+    private static readonly UIntPtr StallTimerId  = 2;
+    private const uint HealthIntervalMs = 5000;
+    private const uint StallPollMs      = 50;
+
+    private sealed class Device
+    {
+        public required HidContactParser Parser;
+        public required TouchFrameAssembler Assembler;
+    }
 
     private IntPtr _hwnd;
+    private IntPtr _powerNotify;
     private WndProcDelegate? _wndProcDelegate;
-    private readonly Dictionary<IntPtr, HidContactParser> _parsers = new();
+    private readonly Dictionary<IntPtr, Device> _devices = new();
+    private readonly FrameWatchdog _watchdog = new();
+    private bool _stallTimerArmed;
+
+    private static double WallSeconds() => Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
 
     public void Start()
     {
@@ -37,6 +71,16 @@ public sealed class TouchpadListener : IDisposable
         if (_hwnd == IntPtr.Zero)
             throw new InvalidOperationException($"CreateWindowEx failed: {Marshal.GetLastWin32Error()}");
 
+        if (!RegisterRawInput())
+            throw new InvalidOperationException($"RegisterRawInputDevices failed: {Marshal.GetLastWin32Error()}");
+
+        // Best effort: without it we lose only the resume hook; the health check still recovers.
+        _powerNotify = RegisterSuspendResumeNotification(_hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
+        SetTimer(_hwnd, HealthTimerId, HealthIntervalMs, IntPtr.Zero);
+    }
+
+    private bool RegisterRawInput()
+    {
         var rid = new RAWINPUTDEVICE[]
         {
             new()
@@ -47,28 +91,98 @@ public sealed class TouchpadListener : IDisposable
                 hwndTarget  = _hwnd,
             }
         };
-
-        if (!RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>()))
-            throw new InvalidOperationException($"RegisterRawInputDevices failed: {Marshal.GetLastWin32Error()}");
-
-        var thread = new Thread(MessageLoop) { IsBackground = true, Name = "ScrollStrip-MsgLoop" };
-        thread.Start();
+        return RegisterRawInputDevices(rid, (uint)rid.Length, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
     }
 
-    private void MessageLoop()
+    /// <summary>Whether this process's touchpad registration still targets our window.</summary>
+    private bool IsRegistered()
     {
-        while (GetMessage(out var msg, _hwnd, 0, 0) > 0)
-        {
-            TranslateMessage(ref msg);
-            DispatchMessage(ref msg);
-        }
+        uint size = (uint)Marshal.SizeOf<RAWINPUTDEVICE>();
+        uint count = 0;
+        GetRegisteredRawInputDevices(null, ref count, size);
+        if (count == 0) return false;
+
+        var devices = new RAWINPUTDEVICE[count];
+        if (GetRegisteredRawInputDevices(devices, ref count, size) == uint.MaxValue) return true; // can't tell; don't churn
+
+        return devices.Any(d => d.usUsagePage == 0x000D && d.usUsage == 0x0005 && d.hwndTarget == _hwnd);
     }
 
     private IntPtr WndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
-        if (msg == WM_INPUT)        { HandleRawInput(lParam); return IntPtr.Zero; }
-        if (msg == WM_INPUT_DEVICE_CHANGE) { _parsers.Clear(); return IntPtr.Zero; }
+        switch ((int)msg)
+        {
+            case WM_INPUT:
+                HandleRawInput(lParam);
+                return IntPtr.Zero;
+
+            case WM_INPUT_DEVICE_CHANGE:
+                ClearDevices();
+                return IntPtr.Zero;
+
+            case WM_TIMER:
+                OnTimer(wParam);
+                return IntPtr.Zero;
+
+            case WM_POWERBROADCAST:
+                OnPower((int)wParam);
+                return new IntPtr(1);   // TRUE: allow the transition
+        }
         return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    private void OnTimer(IntPtr id)
+    {
+        if ((UIntPtr)(ulong)id == StallTimerId)
+        {
+            if (_watchdog.CheckStalled(WallSeconds()))
+            {
+                DisarmStallTimer();
+                EventOccurred?.Invoke(ListenerEvent.ContactLost);
+            }
+        }
+        else if ((UIntPtr)(ulong)id == HealthTimerId)
+        {
+            if (!IsRegistered() && RegisterRawInput())
+                EventOccurred?.Invoke(ListenerEvent.Reregistered);
+        }
+    }
+
+    private void OnPower(int pbt)
+    {
+        switch (pbt)
+        {
+            case PBT_APMSUSPEND:
+                _watchdog.Reset();
+                DisarmStallTimer();
+                EventOccurred?.Invoke(ListenerEvent.Suspending);
+                break;
+
+            // Both can arrive for one wake (AUTOMATIC always, RESUMESUSPEND when a user is
+            // present); handling either is idempotent.
+            case PBT_APMRESUMEAUTOMATIC:
+            case PBT_APMRESUMESUSPEND:
+                RegisterRawInput();
+                ClearDevices();         // device handles and half-assembled frames may be stale
+                _watchdog.Reset();
+                DisarmStallTimer();
+                EventOccurred?.Invoke(ListenerEvent.Resumed);
+                break;
+        }
+    }
+
+    private void ArmStallTimer()
+    {
+        if (_stallTimerArmed) return;
+        SetTimer(_hwnd, StallTimerId, StallPollMs, IntPtr.Zero);
+        _stallTimerArmed = true;
+    }
+
+    private void DisarmStallTimer()
+    {
+        if (!_stallTimerArmed) return;
+        KillTimer(_hwnd, StallTimerId);
+        _stallTimerArmed = false;
     }
 
     private unsafe void HandleRawInput(IntPtr lParam)
@@ -92,28 +206,39 @@ public sealed class TouchpadListener : IDisposable
             uint dwCount   = (uint)Marshal.ReadInt32((IntPtr)p, rawhidOffset + 4);
             if (dwCount == 0 || dwSizeHid == 0) return;
 
+            var device = GetOrCreateDevice(header.hDevice);
+            if (device == null) return;
+
             int dataOffset = rawhidOffset + 8;
-            if (dataOffset + dwSizeHid > size) return;
 
-            byte[] report = new byte[dwSizeHid];
-            Marshal.Copy((IntPtr)(p + dataOffset), report, 0, (int)dwSizeHid);
+            // A single WM_INPUT may batch several reports back to back.
+            for (uint i = 0; i < dwCount; i++)
+            {
+                long offset = dataOffset + (long)i * dwSizeHid;
+                if (offset + dwSizeHid > size) break;
 
-            var parser = GetOrCreateParser(header.hDevice);
-            if (parser == null) return;
+                byte[] report = new byte[dwSizeHid];
+                Marshal.Copy((IntPtr)(p + offset), report, 0, (int)dwSizeHid);
 
-            int contactCount = parser.GetContactCount(report);
-            var contacts = parser.Parse(report);
+                var parse = device.Parser.Parse(report);
+                var frame = device.Assembler.Add(parse, device.Parser.PadWidthMm, device.Parser.PadHeightMm);
+                if (frame == null) continue;
 
-            if (contacts.Count > 0 || contactCount >= 0)
-                ContactsReceived?.Invoke(contacts, contactCount);
+                // Any tip-down contact counts, confident or not: a resting palm reports too.
+                bool down = frame.Contacts.Any(c => c.TipDown);
+                _watchdog.OnFrame(WallSeconds(), down);
+                if (down) ArmStallTimer(); else DisarmStallTimer();
+
+                FrameReceived?.Invoke(frame);
+            }
         }
     }
 
-    private HidContactParser? GetOrCreateParser(IntPtr hDevice)
+    private Device? GetOrCreateDevice(IntPtr hDevice)
     {
         if (hDevice == IntPtr.Zero) return null;
 
-        if (_parsers.TryGetValue(hDevice, out var existing) && existing.IsValid)
+        if (_devices.TryGetValue(hDevice, out var existing) && existing.Parser.IsValid)
             return existing;
 
         var parser = new HidContactParser();
@@ -123,34 +248,28 @@ public sealed class TouchpadListener : IDisposable
             return null;
         }
 
-        _parsers[hDevice] = parser;
-        return parser;
+        var device = new Device { Parser = parser, Assembler = new TouchFrameAssembler() };
+        _devices[hDevice] = device;
+        return device;
+    }
+
+    private void ClearDevices()
+    {
+        foreach (var d in _devices.Values) d.Parser.Dispose();
+        _devices.Clear();
     }
 
     public void Dispose()
     {
         if (_hwnd != IntPtr.Zero)
         {
-            PostQuitMessage(0);
+            KillTimer(_hwnd, HealthTimerId);
+            DisarmStallTimer();
+            if (_powerNotify != IntPtr.Zero) UnregisterSuspendResumeNotification(_powerNotify);
+            DestroyWindow(_hwnd);
             _hwnd = IntPtr.Zero;
         }
-        foreach (var p in _parsers.Values) p.Dispose();
-        _parsers.Clear();
+        ClearDevices();
         _wndProcDelegate = null;
     }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MSG
-    {
-        public IntPtr hwnd;
-        public uint message;
-        public IntPtr wParam, lParam;
-        public uint time;
-        public int ptX, ptY;
-    }
-
-    [DllImport("user32.dll")] private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max);
-    [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG lpMsg);
-    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG lpMsg);
-    [DllImport("user32.dll")] private static extern void PostQuitMessage(int nExitCode);
 }

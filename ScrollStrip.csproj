@@ -8,10 +8,20 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>Resources\tray.ico</ApplicationIcon>
     <AssemblyName>ScrollStrip</AssemblyName>
+    <!-- Release version; tag the merge commit on main with the same number (e.g. 1.1.0). -->
+    <Version>1.1.0</Version>
     <RootNamespace>ScrollStrip</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <Resource Include="Resources\tray.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The test project lives under the app's folder; keep the app's default globs out of it. -->
+    <Compile Remove="ScrollStrip.Tests\**" />
+    <None Remove="ScrollStrip.Tests\**" />
+    <EmbeddedResource Remove="ScrollStrip.Tests\**" />
+    <Page Remove="ScrollStrip.Tests\**" />
+    <InternalsVisibleTo Include="ScrollStrip.Tests" />
   </ItemGroup>
 </Project>
