@@ -22,7 +22,8 @@ public sealed class EdgeScrollController : IDisposable
     public event Action<TouchFrame, EdgeScrollDiagnostics>? FrameProcessed;
 
     private readonly AppSettings _settings;
-    private State _state = State.Idle;
+    // Volatile: the wheel-suppression hook reads it from its own thread via IsScrollActive.
+    private volatile State _state = State.Idle;
     private int _trackedContactId = -1;
     private EdgeZone _zone = EdgeZone.None;  // zone of the active scroll
     private bool _isVertical;                // true = left/right edge, false = bottom edge
@@ -110,7 +111,7 @@ public sealed class EdgeScrollController : IDisposable
 
     private void ProcessFrame(List<TouchContact> activeContacts)
     {
-        if (!_settings.EdgeScrollEnabled)
+        if (!_settings.EdgeScrollEnabled || Suspended)
         {
             if (_state != State.Idle) ExitScroll(allowInertia: false);
             StopInertia();
@@ -294,8 +295,7 @@ public sealed class EdgeScrollController : IDisposable
         if (amount == 0) return;
         _accumulator -= amount;
 
-        if (_isVertical  && _settings.InvertVerticalScroll)   amount = -amount;
-        if (!_isVertical && _settings.InvertHorizontalScroll) amount = -amount;
+        if (IsInverted(_zone)) amount = -amount;
 
         _frameEmitted += amount;
         _output.Scroll(amount, _isVertical);
@@ -304,6 +304,7 @@ public sealed class EdgeScrollController : IDisposable
     private void ExitScroll(bool allowInertia)
     {
         bool wasScrolling = _state == State.Scrolling;
+        var zone          = _zone;   // the coast needs it after the reset below
         _state            = State.Idle;
         _trackedContactId = -1;
         _zone             = EdgeZone.None;
@@ -314,16 +315,15 @@ public sealed class EdgeScrollController : IDisposable
         bool freshVelocity = _haveLaunchVelocity && _frameTime - _launchVelocityTime <= StaleReferenceSec;
 
         if (allowInertia && wasScrolling && _settings.InertiaEnabled && freshVelocity)
-            BeginInertia();
+            BeginInertia(zone);
     }
 
-    private void BeginInertia()
+    private void BeginInertia(EdgeZone zone)
     {
         double speed  = _isVertical ? _settings.VerticalScrollSpeedMultiplier : _settings.HorizontalScrollSpeedMultiplier;
         double launch = InertiaPhysics.LaunchVelocity(_launchVelocity, 2000.0 * speed, FlickThreshold);
 
-        if (_isVertical  && _settings.InvertVerticalScroll)   launch = -launch;
-        if (!_isVertical && _settings.InvertHorizontalScroll) launch = -launch;
+        if (IsInverted(zone)) launch = -launch;
 
         if (Math.Abs(launch) <= InertiaTerminus) return;
 
@@ -334,6 +334,58 @@ public sealed class EdgeScrollController : IDisposable
     }
 
     private void StopInertia() => _inertia.Stop();
+
+    /// <summary>Per-zone direction: each side edge has its own invert; the bottom edge uses the horizontal one.</summary>
+    private bool IsInverted(EdgeZone zone) => zone switch
+    {
+        EdgeZone.Right  => _settings.InvertVerticalScroll,
+        EdgeZone.Left   => _settings.InvertLeftEdgeScroll,
+        EdgeZone.Bottom => _settings.InvertHorizontalScroll,
+        _               => false,
+    };
+
+    // ── Outside events ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Set while the foreground app is excluded. Setting it ends any scroll or coast at once — a
+    /// coast must not run on into the excluded app — and frames are ignored until it is cleared.
+    /// Call on the thread that delivers frames.
+    /// </summary>
+    public bool Suspended
+    {
+        get => _suspended;
+        set
+        {
+            if (value && !_suspended) Reset();
+            _suspended = value;
+        }
+    }
+    private bool _suspended;
+
+    /// <summary>
+    /// True while a scroll is being emitted, by the finger or a coast. Read by the native-wheel
+    /// suppression hook on its own thread, so it touches only volatile state and takes no lock.
+    /// </summary>
+    public bool IsScrollActive => _state == State.Scrolling || _inertia.IsActive;
+
+    /// <summary>
+    /// The watchdog declared the contact's lift report lost. End the gesture without a coast: the
+    /// finger lifted at some unknown point in the silence, so the last velocity is stale.
+    /// </summary>
+    public void OnContactLost()
+    {
+        if (_state != State.Idle) ExitScroll(allowInertia: false);
+        _gestureContactId = -1;
+    }
+
+    /// <summary>Drops all gesture and coast state — on sleep and on wake.</summary>
+    public void Reset()
+    {
+        if (_state != State.Idle) ExitScroll(allowInertia: false);
+        StopInertia();
+        _gestureContactId = -1;
+        _inertiaStartedAt = double.NegativeInfinity;
+    }
 
     private void LockCursor()
     {

@@ -30,6 +30,9 @@ public class AppSettings : INotifyPropertyChanged
     private bool _runAtStartup = false;
     private bool _invertVerticalScroll = false;
     private bool _invertHorizontalScroll = false;
+    private bool _invertLeftEdgeScroll = false;
+    private bool _suppressNativeWheel = false;
+    private List<string> _excludedApps = new();
     private bool _inertiaEnabled = true;
     private int _inertiaStrength = 5;
 
@@ -54,6 +57,30 @@ public class AppSettings : INotifyPropertyChanged
     public bool RunAtStartup                       { get => _runAtStartup;                     set { Set(ref _runAtStartup, value); if (_persist) ApplyStartup(value); } }
     public bool InvertVerticalScroll               { get => _invertVerticalScroll;             set => Set(ref _invertVerticalScroll, value); }
     public bool InvertHorizontalScroll             { get => _invertHorizontalScroll;           set => Set(ref _invertHorizontalScroll, value); }
+    /// <summary>Direction of the left edge. The right edge uses <see cref="InvertVerticalScroll"/>.</summary>
+    public bool InvertLeftEdgeScroll               { get => _invertLeftEdgeScroll;             set => Set(ref _invertLeftEdgeScroll, value); }
+    /// <summary>Drop the touchpad driver's own wheel events while ScrollStrip is scrolling (low-level mouse hook).</summary>
+    public bool SuppressNativeWheel                { get => _suppressNativeWheel;              set => Set(ref _suppressNativeWheel, value); }
+
+    /// <summary>
+    /// Process names (no ".exe", any case) in whose foreground windows edge scrolling is off.
+    /// Replace the list to change it — mutating it in place would neither notify nor save.
+    /// </summary>
+    public List<string> ExcludedApps
+    {
+        get => _excludedApps;
+        set => Set(ref _excludedApps, (value ?? new()).Select(NormalizeAppName).Where(n => n.Length > 0)
+                                                     .Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+    }
+
+    public bool IsExcluded(string? processName) =>
+        processName != null && _excludedApps.Contains(NormalizeAppName(processName), StringComparer.OrdinalIgnoreCase);
+
+    public static string NormalizeAppName(string name)
+    {
+        name = name.Trim();
+        return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4].TrimEnd() : name;
+    }
     public bool InertiaEnabled                     { get => _inertiaEnabled;                   set => Set(ref _inertiaEnabled, value); }
     public int  InertiaStrength                    { get => _inertiaStrength;                  set => Set(ref _inertiaStrength, Math.Clamp(value, 1, 10)); }
 

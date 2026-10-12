@@ -81,6 +81,8 @@ public interface IInertia : IDisposable
     void Start(double launchPerTick, bool vertical, double decel, double terminus);
     /// <summary>Stops the coast. No step is posted after this returns.</summary>
     void Stop();
+    /// <summary>True while a coast is running. Lock-free: read from a low-level hook.</summary>
+    bool IsActive { get; }
 }
 
 public sealed class InertiaScroller : IInertia
@@ -100,6 +102,11 @@ public sealed class InertiaScroller : IInertia
     private long _lastTick;
 
     private volatile bool _disposed;
+    // Mirrors _physics != null. Written under _lock, read without it: IsActive is called from the
+    // low-level mouse hook, which must never wait on the lock the inertia thread holds in SendInput.
+    private volatile bool _active;
+
+    public bool IsActive => _active;
 
     /// <param name="sink">Posts a wheel amount; true = vertical. Called on the inertia thread.</param>
     public InertiaScroller(Action<int, bool> sink)
@@ -126,6 +133,7 @@ public sealed class InertiaScroller : IInertia
         lock (_lock)
         {
             _physics  = new InertiaPhysics(launchPerTick, decel, terminus);
+            _active   = true;
             _vertical = vertical;
             _lastTick = Stopwatch.GetTimestamp();
         }
@@ -135,7 +143,7 @@ public sealed class InertiaScroller : IInertia
     /// <summary>Stops the coast. No step is posted after this returns.</summary>
     public void Stop()
     {
-        lock (_lock) _physics = null;
+        lock (_lock) { _physics = null; _active = false; }
     }
 
     private void Run()
@@ -164,7 +172,7 @@ public sealed class InertiaScroller : IInertia
                 // Posting under the lock is what lets Stop() promise no late step; SendInput is µs.
                 int amount = _physics.Step(dt);
                 if (amount != 0) _sink(amount, _vertical);
-                if (_physics.IsDone) _physics = null;
+                if (_physics.IsDone) { _physics = null; _active = false; }
             }
         }
     }

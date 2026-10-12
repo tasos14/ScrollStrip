@@ -12,6 +12,12 @@ public sealed class FrameRecorder : IDisposable
 {
     private readonly StreamWriter _writer;
     private readonly object _lock = new();
+    internal static readonly string[] Columns =
+    [
+        "seq", "time_s", "dt_ms", "clock", "scan_time_raw", "reported_count", "finger_count",
+        "contact_index", "contact_id", "norm_x", "norm_y", "tip", "confident",
+        "pad_w_mm", "pad_h_mm", "zone", "tracked_zone", "state", "velocity", "emitted_delta", "inertia_launch",
+    ];
     private const string EmptyContactColumns = ",,,,,";
     private long _seq;
     private double _lastTime = double.NaN;
@@ -23,9 +29,7 @@ public sealed class FrameRecorder : IDisposable
         Path = System.IO.Path.GetFullPath(path);
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
         _writer = new StreamWriter(Path, append: false, Encoding.UTF8) { AutoFlush = true };
-        _writer.WriteLine("seq,time_s,dt_ms,clock,scan_time_raw,reported_count,finger_count," +
-                          "contact_index,contact_id,norm_x,norm_y,tip,confident," +
-                          "pad_w_mm,pad_h_mm,zone,tracked_zone,state,velocity,emitted_delta,inertia_launch");
+        _writer.WriteLine(string.Join(",", Columns));
     }
 
     public void Record(TouchFrame frame, EdgeScrollDiagnostics diag)
@@ -57,6 +61,21 @@ public sealed class FrameRecorder : IDisposable
                     $"{head},{i},{c.ContactId},{c.NormX:F5},{c.NormY:F5}," +
                     $"{(c.TipDown ? 1 : 0)},{(c.Confident ? 1 : 0)},{tail}"));
             }
+        }
+    }
+
+    /// <summary>
+    /// Writes a non-frame event — a lost contact, sleep, wake — as a row with only seq and the event
+    /// name in <c>state</c>, so a recording shows when the watchdog and power handling fired.
+    /// </summary>
+    public void RecordEvent(ListenerEvent e)
+    {
+        lock (_lock)
+        {
+            var row = new string[Columns.Length];
+            row[0] = (_seq++).ToString(CultureInfo.InvariantCulture);
+            row[Array.IndexOf(Columns, "state")] = "!" + e;
+            _writer.WriteLine(string.Join(",", row));
         }
     }
 

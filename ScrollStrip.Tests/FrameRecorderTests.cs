@@ -80,6 +80,35 @@ public class FrameRecorderTests
         }
     }
 
+    [Fact]
+    public void Event_rows_have_the_header_column_count_and_name_the_event()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"scrollstrip-test-{Guid.NewGuid():N}.csv");
+        try
+        {
+            var diag = new EdgeScrollDiagnostics(1, EdgeZone.Right, EdgeZone.Right, "Scrolling", 1.0, 1, 0);
+            using (var rec = new FrameRecorder(path))
+            {
+                rec.Record(Frame(new TouchContact(1, 0.97, 0.5, true, true)), diag);
+                rec.RecordEvent(ListenerEvent.ContactLost);
+                rec.RecordEvent(ListenerEvent.Resumed);
+            }
+
+            var lines = File.ReadAllLines(path);
+            int columns = lines[0].Split(',').Length;
+            int state = Array.IndexOf(lines[0].Split(','), "state");
+
+            Assert.All(lines, l => Assert.Equal(columns, l.Split(',').Length));
+            Assert.Equal("!ContactLost", lines[2].Split(',')[state]);
+            Assert.Equal("!Resumed", lines[3].Split(',')[state]);
+            Assert.Equal(new[] { "0", "1", "2" }, lines.Skip(1).Select(l => l.Split(',')[0]));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     private static TouchFrame Frame(params TouchContact[] contacts) =>
         new(contacts, contacts.Length, 12.3456, FrameClock.WallClock, 0, 160.0, 114.9);
 }

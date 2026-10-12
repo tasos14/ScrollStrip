@@ -33,6 +33,7 @@ internal sealed class RecordingInertia : IInertia
     public List<(double Launch, bool Vertical, double Decel, double Terminus)> Starts { get; } = new();
     public int Stops { get; private set; }
     public bool Active { get; private set; }
+    public bool IsActive => Active;
 
     public void Start(double launchPerTick, bool vertical, double decel, double terminus)
     {

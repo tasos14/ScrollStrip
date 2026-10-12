@@ -423,4 +423,142 @@ public class EdgeScrollControllerTests
 
         Assert.False(pad.Inertia.Active);
     }
+
+    // ── Phase 5: outside events ──────────────────────────────────────────
+
+    [Fact]
+    public void Lost_contact_ends_the_scroll_unpins_and_does_not_coast()
+    {
+        using var pad = new Pad();
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.2, frames: 10);   // flick speed, then silence
+        Assert.True(pad.Output.Locked);
+
+        pad.Controller.OnContactLost();
+
+        Assert.False(pad.Output.Locked);
+        Assert.Empty(pad.Inertia.Starts);
+        Assert.False(pad.Controller.IsScrollActive);
+    }
+
+    [Fact]
+    public void After_a_lost_contact_the_next_touch_in_the_zone_scrolls()
+    {
+        using var pad = new Pad();
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.6, frames: 10);
+        pad.Controller.OnContactLost();
+        int before = pad.Output.Count;
+
+        // The lift really was lost: a new contact ID appears, as in the recordings.
+        pad.FrameAfter(0.6, Finger(9, InRightZone, 0.7));
+        pad.Drag(9, InRightZone, 0.7, InRightZone, 0.4, frames: 10, touchDown: false);
+
+        Assert.True(pad.Output.Count > before);
+    }
+
+    [Fact]
+    public void After_a_lost_contact_a_paused_finger_resuming_in_the_zone_scrolls_again()
+    {
+        using var pad = new Pad();
+
+        // The watchdog can't tell a long pause from a lost lift; if the same contact resumes,
+        // it must be able to scroll again rather than be stuck as ineligible.
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.6, frames: 10);
+        pad.Controller.OnContactLost();
+        int before = pad.Output.Count;
+
+        pad.FrameAfter(0.3, Finger(1, InRightZone, 0.6));
+        pad.Drag(1, InRightZone, 0.6, InRightZone, 0.3, frames: 10, touchDown: false);
+
+        Assert.True(pad.Output.Count > before);
+    }
+
+    [Fact]
+    public void Suspending_ends_a_scroll_and_a_coast_at_once()
+    {
+        using var pad = new Pad();
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.2, frames: 10);
+        pad.Lift(1, InRightZone, 0.2);
+        Assert.True(pad.Inertia.Active);
+
+        pad.Controller.Suspended = true;   // e.g. an excluded app came to the front
+
+        Assert.False(pad.Inertia.Active);
+        Assert.False(pad.Output.Locked);
+    }
+
+    [Fact]
+    public void While_suspended_frames_are_ignored_and_scrolling_resumes_after()
+    {
+        using var pad = new Pad();
+        pad.Controller.Suspended = true;
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.4, frames: 20);
+        pad.Lift(1, InRightZone, 0.4);
+        Assert.Empty(pad.Output.Scrolls);
+
+        pad.Controller.Suspended = false;
+        pad.Drag(2, InRightZone, 0.8, InRightZone, 0.4, frames: 20);
+        Assert.True(pad.Output.Count > 0);
+    }
+
+    [Fact]
+    public void Reset_drops_the_scroll_and_the_coast()
+    {
+        using var pad = new Pad();
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.5, frames: 10);
+        pad.Controller.Reset();
+
+        Assert.False(pad.Output.Locked);
+        Assert.False(pad.Inertia.Active);
+        Assert.Equal("Idle", pad.Frame(Finger(1, Centre, 0.5)).State);
+    }
+
+    [Fact]
+    public void IsScrollActive_covers_the_drag_and_the_coast()
+    {
+        using var pad = new Pad();
+        Assert.False(pad.Controller.IsScrollActive);
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.2, frames: 10);
+        Assert.True(pad.Controller.IsScrollActive);   // finger scrolling
+
+        pad.Lift(1, InRightZone, 0.2);
+        Assert.True(pad.Controller.IsScrollActive);   // coasting
+
+        pad.Inertia.Stop();
+        Assert.False(pad.Controller.IsScrollActive);
+    }
+
+    [Fact]
+    public void Resting_in_the_zone_is_not_an_active_scroll()
+    {
+        using var pad = new Pad();
+
+        pad.Frame(Finger(1, InRightZone, 0.5));
+        pad.Hold(1, InRightZone, 0.5, frames: 10);
+
+        Assert.Equal("EdgeContact", pad.Last.State);
+        Assert.False(pad.Controller.IsScrollActive);   // a wheel hook must not drop input yet
+    }
+
+    [Fact]
+    public void Left_edge_direction_is_independent_of_the_right_edge()
+    {
+        using var pad = new Pad(s => { s.LeftEdgeEnabled = true; s.InvertLeftEdgeScroll = true; });
+
+        pad.Drag(1, InRightZone, 0.8, InRightZone, 0.4, frames: 20);
+        pad.Lift(1, InRightZone, 0.4);
+        int right = pad.Output.Total(vertical: true);
+
+        pad.FrameAfter(0.5);
+        pad.Drag(2, 0.03, 0.8, 0.03, 0.4, frames: 20);
+        int left = pad.Output.Total(vertical: true) - right;
+
+        Assert.True(right > 0);
+        Assert.True(left < 0);
+    }
 }

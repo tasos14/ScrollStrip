@@ -295,15 +295,59 @@ On hardware: 175 coasts from 185 scroll episodes. The other 10 were rested or tw
 13. **Corner shortcuts**: a tap in a corner sends a configured key chord through `SendInput`.
 14. **Per-zone required modifier**: a zone fires only while the configured modifier set is held (`GetAsyncKeyState`). This allows e.g. "Shift + right edge = horizontal".
 
-### Phase 5 — Robustness and UX
+### Phase 5 — Robustness and UX — **done**
 
 15. Re-register Raw Input on `WM_POWERBROADCAST` resume. Add a no-frames watchdog.
+    - **Resume.** Our window is message-only, and message-only windows receive no broadcasts, so `WM_POWERBROADCAST` never arrived. The window now calls `RegisterSuspendResumeNotification`.
+      - On `PBT_APMSUSPEND`, the recognizer resets, which unpins the cursor.
+      - On `PBT_APMRESUMEAUTOMATIC` or `PBT_APMRESUMESUSPEND`, raw input is re-registered, parsers and half-assembled frames are dropped, and the recognizer resets. Handling both is idempotent.
+    - **Watchdog, redefined from the recordings.** Scroll's watchdog restarts when no touches arrive at all. On Windows, the observed failure is different: the pad sometimes drops the lift report. [O, Windows]
+      - Four times in two recordings, a new contact ID appeared after a 0.29–1.8 s gap with no tip-up in between.
+      - Meanwhile the recognizer stayed mid-gesture. Once, at `Scrolling`, this kept the cursor pinned 619 ms after the finger lifted.
+      - A resting finger keeps reporting about every 11 ms (3,605 identical-position frames), so silence while a contact is down is a reliable signal.
+      - The same pad also pauses 131–235 ms with the finger genuinely down (the same ID resumes).
+      - `FrameWatchdog` therefore declares a contact lost after **250 ms** of silence. The recognizer then ends the gesture with no coast, because the last velocity is stale.
+      - A poll timer runs only while a contact is down.
+    - **Registration health check.** Every 5 s, `GetRegisteredRawInputDevices` confirms our window is still the target for `0x0D/0x05`, and re-registers if not.
+    - `--record` writes `!Suspending`, `!Resumed`, `!Reregistered` and `!ContactLost` rows.
 16. Per-app exclusion via `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` → process name.
+    - Built as `ForegroundAppWatcher`: an out-of-context hook on the UI thread with `WINEVENT_SKIPOWNPROCESS`, so the settings window doesn't count as an app in front.
+    - `AppSettings.ExcludedApps` is matched case-insensitively and without `.exe`.
+    - Setting `EdgeScrollController.Suspended` ends a scroll or coast at once, so a coast cannot carry on into the excluded app.
+    - UWP apps report as `ApplicationFrameHost`. The foreground app is used, not the window under the cursor, as in Scroll.
 17. Optional native-wheel suppression via `WH_MOUSE_LL`. This drops non-injected wheel events while scrolling and covers only the legacy-wheel path.
+    - Built as `NativeWheelSuppressor`: off by default, on its own highest-priority thread with a message loop. Windows removes a low-level hook that answers too slowly, so the hook never waits on the UI thread.
+    - Injected events pass before anything else is checked. That includes our own `SendInput` output.
+    - The "scrolling" check, `IsScrollActive`, reads only volatile state. The inertia thread holds its lock while calling `SendInput`, and `SendInput` waits for low-level hooks, so a lock in the hook path could deadlock.
+    - It also blocks a physical mouse wheel during an edge scroll, which the settings text states.
 18. Settings UI:
     - Zone width (mm) and a "device edge" preset.
+      - Buttons for "Default (12 mm)" and "Device edge (1.8 mm)".
     - Per-zone direction, action and modifier.
+      - **Direction only.** Each edge has its own **Invert**; the left edge gained `InvertLeftEdgeScroll`.
+      - *Action* and *modifier* have nothing to configure until Phase 4, which is deferred.
     - Speed, inertia strength, and a began-in-zone toggle.
+      - Present since Phase 2.
+    - The window is now two columns, sized to content. It adds the Excluded Apps list (pick a running app, or type a name) and an Advanced group for item 17.
+
+#### Found along the way [O]
+
+- **Coast ignored invert.** Per-zone inversion read `_zone`, which `ExitScroll` clears before `BeginInertia` runs, so an inverted edge coasted the wrong way at lift. The zone is now captured first and passed in. The existing Phase 2 invert test caught it before hardware.
+- **Dead message-loop thread.** `TouchpadListener` created its window on the calling (UI) thread, then ran `GetMessage(_hwnd…)` on a second thread. `GetMessage` only reads messages for windows the calling thread owns, so that thread exited at once. The WPF dispatcher had always pumped our `WM_INPUT`.
+  - The thread is removed and the comment in `App.xaml.cs` corrected.
+  - The listener, the foreground hook and the settings window all run on the UI thread. Only the inertia thread and the wheel hook touch the recognizer from elsewhere, through its lock-free members.
+- **Settings screenshot.** The README's `assets/settings.png` was regenerated by a harness that opens only `SettingsWindow` with in-memory settings. The first capture showed the Advanced label truncated and the columns uneven; both are fixed.
+
+#### Verification status
+
+- 116 unit tests (33 new) cover all of the Phase 5 logic that does not need the OS:
+  - the watchdog thresholds, against the observed pause and lost-lift durations
+  - lost contact, suspend, reset and `IsScrollActive` in the recognizer
+  - per-edge direction
+  - the suppression decision
+  - exclusion matching
+  - event rows in the CSV
+- **Not yet confirmed from a recording:** the Win32 paths themselves — suspend/resume delivery to the message-only window, the foreground hook, and the low-level wheel hook.
 
 ### Verification
 
@@ -322,7 +366,7 @@ On hardware: 175 coasts from 185 scroll episodes. The other 10 were rested or tw
   - phantom contact at lift
   - corner hold — *not yet; Phase 4 is deferred*
 
-  **Done.** `ScrollStrip.Tests` (xUnit, `net8.0-windows`), 83 tests; run with `dotnet test ScrollStrip.Tests`.
+  **Done.** `ScrollStrip.Tests` (xUnit, `net8.0-windows`), 116 tests (83 at first, 33 more with Phase 5); run with `dotnet test ScrollStrip.Tests`.
 
   | File | Covers |
   |---|---|
@@ -331,7 +375,8 @@ On hardware: 175 coasts from 185 scroll episodes. The other 10 were rested or tw
   | `InertiaTests` | `InertiaPhysics`: strength mapping, boosts, flick threshold, geometric coast distance, jitter independence, terminus, fractions, sign. `InertiaScroller` on its real thread: coasts and stops by itself; nothing posted after `Stop()` |
   | `HidUnitsTests` | `TryPhysicalMm`: cm and inch, sign-extended exponent, physical range, rejected units and sizes |
   | `FrameRecorderTests` | `--record` argument forms; constant column count under a comma-decimal culture |
-  | `AppSettingsTests` | Instances not from `Load()` never write the user's file; clamping; loading pre-Phase-2 settings |
+  | `AppSettingsTests` | Instances not from `Load()` never write the user's file; clamping; loading pre-Phase-2 settings; app exclusion matching |
+  | `FrameWatchdogTests` | Lost-lift timeout against the observed pauses and gaps; `NativeWheelSuppressor.ShouldSuppress` |
 
   Seams added for this:
   - `EdgeScrollController(settings, IScrollOutput?, IInertia?)`. `Win32ScrollOutput` holds the `SendInput` and `ClipCursor` code.
