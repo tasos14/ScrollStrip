@@ -48,14 +48,23 @@ public sealed class ScanTimeClock
     private int _stuckFrames;
     private bool _haveRaw;
     private ushort _lastRaw;
-    private long _lastWall;
+    private readonly Func<double> _wallSeconds;
+    private bool _haveWall;
+    private double _lastWall;
     private double _seconds;
+
+    /// <param name="wallSeconds">Monotonic wall clock in seconds; Stopwatch when null. Injected by tests.</param>
+    public ScanTimeClock(Func<double>? wallSeconds = null)
+    {
+        _wallSeconds = wallSeconds ?? (() => Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency);
+    }
 
     /// <summary>Advances the clock by one frame and returns its timestamp in seconds.</summary>
     public double Advance(bool hasScanTime, ushort raw, out FrameClock source)
     {
-        long now = Stopwatch.GetTimestamp();
-        double wallDelta = _lastWall == 0 ? 0 : (now - _lastWall) / (double)Stopwatch.Frequency;
+        double now = _wallSeconds();
+        double wallDelta = _haveWall ? now - _lastWall : 0;
+        _haveWall = true;
         _lastWall = now;
 
         source = FrameClock.WallClock;
@@ -98,7 +107,7 @@ public sealed class ScanTimeClock
     public void Reset()
     {
         _haveRaw     = false;
-        _lastWall    = 0;
+        _haveWall    = false;
         _trusted     = true;
         _stuckFrames = 0;
     }
@@ -111,8 +120,11 @@ public sealed class ScanTimeClock
 /// </summary>
 public sealed class TouchFrameAssembler
 {
-    private readonly ScanTimeClock _clock = new();
+    private readonly ScanTimeClock _clock;
     private readonly List<TouchContact> _pending = new();
+
+    /// <param name="clock">Frame clock; a Stopwatch-backed one when null. Injected by tests.</param>
+    public TouchFrameAssembler(ScanTimeClock? clock = null) => _clock = clock ?? new ScanTimeClock();
 
     private bool _assembling;
     private int _expected;

@@ -51,13 +51,17 @@ public class AppSettings : INotifyPropertyChanged
     public double VerticalScrollSpeedMultiplier    { get => _verticalScrollSpeedMultiplier;    set => Set(ref _verticalScrollSpeedMultiplier, Math.Clamp(value, 0.5, 5.0)); }
     public double HorizontalScrollSpeedMultiplier  { get => _horizontalScrollSpeedMultiplier;  set => Set(ref _horizontalScrollSpeedMultiplier, Math.Clamp(value, 0.5, 5.0)); }
     public bool LockCursorDuringScroll             { get => _lockCursorDuringScroll;           set => Set(ref _lockCursorDuringScroll, value); }
-    public bool RunAtStartup                       { get => _runAtStartup;                     set { Set(ref _runAtStartup, value); ApplyStartup(value); } }
+    public bool RunAtStartup                       { get => _runAtStartup;                     set { Set(ref _runAtStartup, value); if (_persist) ApplyStartup(value); } }
     public bool InvertVerticalScroll               { get => _invertVerticalScroll;             set => Set(ref _invertVerticalScroll, value); }
     public bool InvertHorizontalScroll             { get => _invertHorizontalScroll;           set => Set(ref _invertHorizontalScroll, value); }
     public bool InertiaEnabled                     { get => _inertiaEnabled;                   set => Set(ref _inertiaEnabled, value); }
     public int  InertiaStrength                    { get => _inertiaStrength;                  set => Set(ref _inertiaStrength, Math.Clamp(value, 1, 10)); }
 
     public event PropertyChangedEventHandler? PropertyChanged;
+
+    // Only the instance Load() returns writes to disk and the registry. Deserialization and
+    // instances built in tests stay in memory, so neither can overwrite the user's settings.
+    private bool _persist;
 
     private void Set<T>(ref T field, T value, [CallerMemberName] string? prop = null)
     {
@@ -69,20 +73,24 @@ public class AppSettings : INotifyPropertyChanged
 
     public static AppSettings Load()
     {
+        AppSettings? settings = null;
         try
         {
             if (File.Exists(SettingsPath))
-            {
-                var json = File.ReadAllText(SettingsPath);
-                return JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
-            }
+                settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath));
         }
         catch { }
-        return new AppSettings();
+
+        settings ??= new AppSettings();
+        settings._persist = true;
+        // Re-register on every launch so the Run key follows the exe if it has moved.
+        if (settings.RunAtStartup) ApplyStartup(true);
+        return settings;
     }
 
     public void Save()
     {
+        if (!_persist) return;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);

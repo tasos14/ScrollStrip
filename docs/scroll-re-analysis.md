@@ -320,7 +320,33 @@ On hardware: 175 coasts from 185 scroll episodes. The other 10 were rested or tw
   - leave the zone mid-scroll
   - second finger mid-scroll
   - phantom contact at lift
-  - corner hold
+  - corner hold — *not yet; Phase 4 is deferred*
+
+  **Done.** `ScrollStrip.Tests` (xUnit, `net8.0-windows`), 83 tests; run with `dotnet test ScrollStrip.Tests`.
+
+  | File | Covers |
+  |---|---|
+  | `EdgeScrollControllerTests` | The list above, plus a regression test for each hardware finding: cursor pinned only at first scroll, batched sub-ms frames, sub-dead-zone drift, rest before lift, non-confident palm mid-scroll. Also zone geometry (mm and % fallback), left and bottom edges, invert, strength, min-velocity gate |
+  | `TouchFrameTests` | `ScanTimeClock`: unwrap, rollover, frozen counter, permanent distrust, idle gap, monotonicity. `TouchFrameAssembler`: Contact Count prefix, hybrid frames, restart, all-up, no-count devices |
+  | `InertiaTests` | `InertiaPhysics`: strength mapping, boosts, flick threshold, geometric coast distance, jitter independence, terminus, fractions, sign. `InertiaScroller` on its real thread: coasts and stops by itself; nothing posted after `Stop()` |
+  | `HidUnitsTests` | `TryPhysicalMm`: cm and inch, sign-extended exponent, physical range, rejected units and sizes |
+  | `FrameRecorderTests` | `--record` argument forms; constant column count under a comma-decimal culture |
+  | `AppSettingsTests` | Instances not from `Load()` never write the user's file; clamping; loading pre-Phase-2 settings |
+
+  Seams added for this:
+  - `EdgeScrollController(settings, IScrollOutput?, IInertia?)`. `Win32ScrollOutput` holds the `SendInput` and `ClipCursor` code.
+  - `ScanTimeClock(Func<double>? wallSeconds)` and `TouchFrameAssembler(ScanTimeClock?)`.
+  - Frame time already came from `TouchFrame.TimestampSec`, so the recognizer needed no clock.
+
+  `AppSettings` now persists only the instance `Load()` returns, with the guard inside `Save()`. Previously every setter wrote `%APPDATA%\ScrollStrip\settings.json`, so the tests would have overwritten the user's settings.
+
+  The tests were checked by reintroducing four bugs, one at a time:
+  - 8 ms window removed
+  - cursor lock on zone entry
+  - began-in-zone check removed
+  - frozen scan-time detection removed
+
+  Each one fails at least one test. The first attempt at the batched-frame test let the 8 ms bug through: its synthetic batch moved less than the dead zone. Real batching is two full scans of movement arriving 20 µs apart.
 
 ### Still unresolved
 

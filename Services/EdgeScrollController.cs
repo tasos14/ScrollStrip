@@ -60,7 +60,8 @@ public sealed class EdgeScrollController : IDisposable
     public double PadWidthMm { get; private set; }
     public double PadHeightMm { get; private set; }
 
-    private readonly InertiaScroller _inertia;
+    private readonly IScrollOutput _output;
+    private readonly IInertia _inertia;
     private double _inertiaStartedAt = double.NegativeInfinity; // frame time captured in BeginInertia
     private const double PhantomGraceMs = 50;
 
@@ -76,10 +77,13 @@ public sealed class EdgeScrollController : IDisposable
     // Frame time elapsed since inertia last started. HID callback thread only.
     private double InertiaGraceElapsedMs() => (_frameTime - _inertiaStartedAt) * 1000.0;
 
-    public EdgeScrollController(AppSettings settings)
+    /// <param name="output">Wheel and cursor output; real Win32 input when null.</param>
+    /// <param name="inertia">The coast engine; a timer-driven <see cref="InertiaScroller"/> on <paramref name="output"/> when null.</param>
+    public EdgeScrollController(AppSettings settings, IScrollOutput? output = null, IInertia? inertia = null)
     {
         _settings = settings;
-        _inertia  = new InertiaScroller(SendScrollEvent);
+        _output   = output ?? new Win32ScrollOutput();
+        _inertia  = inertia ?? new InertiaScroller(_output.Scroll);
     }
 
     public void OnFrame(TouchFrame frame)
@@ -294,7 +298,7 @@ public sealed class EdgeScrollController : IDisposable
         if (!_isVertical && _settings.InvertHorizontalScroll) amount = -amount;
 
         _frameEmitted += amount;
-        SendScrollEvent(amount, _isVertical);
+        _output.Scroll(amount, _isVertical);
     }
 
     private void ExitScroll(bool allowInertia)
@@ -331,7 +335,40 @@ public sealed class EdgeScrollController : IDisposable
 
     private void StopInertia() => _inertia.Stop();
 
-    private static void SendScrollEvent(int wheelAmount, bool vertical)
+    private void LockCursor()
+    {
+        if (_cursorLocked) return;
+        _cursorLocked = _output.LockCursor();
+    }
+
+    private void UnlockCursor()
+    {
+        if (!_cursorLocked) return;
+        _output.UnlockCursor();
+        _cursorLocked = false;
+    }
+
+    public void Dispose()
+    {
+        _inertia.Dispose();
+        UnlockCursor();
+    }
+}
+
+/// <summary>Where the recognizer's output goes. The default posts real input; tests record it.</summary>
+public interface IScrollOutput
+{
+    /// <summary>Posts a wheel amount; true = vertical. Called on the HID thread and on the inertia thread.</summary>
+    void Scroll(int wheelAmount, bool vertical);
+    /// <summary>Pins the cursor where it is. Returns false if it could not.</summary>
+    bool LockCursor();
+    void UnlockCursor();
+}
+
+/// <summary>Posts wheel events with SendInput and pins the cursor with a 1×1 ClipCursor rect.</summary>
+public sealed class Win32ScrollOutput : IScrollOutput
+{
+    public void Scroll(int wheelAmount, bool vertical)
     {
         var input = new INPUT
         {
@@ -345,23 +382,12 @@ public sealed class EdgeScrollController : IDisposable
         SendInput(1, [input], Marshal.SizeOf<INPUT>());
     }
 
-    private void LockCursor()
+    public bool LockCursor()
     {
-        if (_cursorLocked || !GetCursorPos(out var pt)) return;
+        if (!GetCursorPos(out var pt)) return false;
         var rect = new RECT { Left = pt.X, Top = pt.Y, Right = pt.X + 1, Bottom = pt.Y + 1 };
-        _cursorLocked = ClipCursor(ref rect);
+        return ClipCursor(ref rect);
     }
 
-    private void UnlockCursor()
-    {
-        if (!_cursorLocked) return;
-        ClipCursor(IntPtr.Zero);
-        _cursorLocked = false;
-    }
-
-    public void Dispose()
-    {
-        _inertia.Dispose();
-        UnlockCursor();
-    }
+    public void UnlockCursor() => ClipCursor(IntPtr.Zero);
 }

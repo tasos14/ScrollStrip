@@ -174,7 +174,7 @@ public sealed class HidContactParser : IDisposable
     /// Converts a value cap's physical range to millimetres using the HID Unit and Unit Exponent
     /// nibbles. Windows precision touchpads report centimetres with exponent -2.
     /// </summary>
-    private static bool TryPhysicalMm(in HIDP_VALUE_CAPS vc, out double mm)
+    internal static bool TryPhysicalMm(in HIDP_VALUE_CAPS vc, out double mm)
     {
         mm = 0;
         int range = vc.PhysicalMax - vc.PhysicalMin;

@@ -74,7 +74,16 @@ public sealed class InertiaPhysics
 /// Runs <see cref="InertiaPhysics"/> at ~60 Hz on a dedicated thread driven by a
 /// high-resolution waitable timer, posting each step through the scroll sink.
 /// </summary>
-public sealed class InertiaScroller : IDisposable
+/// <summary>The coast engine the recognizer drives. Lets tests observe launches without a timer thread.</summary>
+public interface IInertia : IDisposable
+{
+    /// <summary>Starts a coast, replacing any in progress.</summary>
+    void Start(double launchPerTick, bool vertical, double decel, double terminus);
+    /// <summary>Stops the coast. No step is posted after this returns.</summary>
+    void Stop();
+}
+
+public sealed class InertiaScroller : IInertia
 {
     private const long TickDue100ns = -166_667;   // relative 16.67 ms
     private const double MaxStepSec = 0.05;       // a stalled thread (sleep, debugger) mustn't jump
