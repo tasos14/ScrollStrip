@@ -8,6 +8,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>Resources\tray.ico</ApplicationIcon>
     <AssemblyName>ScrollStrip</AssemblyName>
+    <!-- Release version; tag the merge commit on main with the same number (e.g. 1.1.0). -->
+    <Version>1.1.0</Version>
     <RootNamespace>ScrollStrip</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
